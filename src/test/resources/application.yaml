@@ -12,3 +12,13 @@ spring:
         dialect: org.hibernate.dialect.H2Dialect
   flyway:
     enabled: false
+
+parkease:
+  security:
+    jwt:
+      secret: test-only-secret-value-not-for-production-use-0123456789
+      access-token-ttl-minutes: 15
+      refresh-token-ttl-days: 7
+  billing:
+    payment-timeout-minutes: 10
+    cancellation-fee-rate: 0.10

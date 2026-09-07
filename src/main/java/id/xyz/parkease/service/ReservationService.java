@@ -31,8 +31,9 @@ import org.springframework.transaction.annotation.Transactional;
 @Transactional
 public class ReservationService {
 
-    private static final long CHECK_IN_GRACE_MINUTES = 30L;
+    public static final long CHECK_IN_GRACE_MINUTES = 30L;
     private static final int CANCELLATION_REASON_MAX_LENGTH = 100;
+    private static final long MAX_RESERVATION_DAYS = 31L;
     private static final String OVERLAP_SQL_STATE = "23P01";
 
     private final ParkingLotRepository parkingLotRepository;
@@ -242,9 +243,6 @@ public class ReservationService {
     }
 
     private List<Reservation> activeReservations(ParkingSlot slot) {
-        // ponytail: 2 queries per slot; getAvailability scans M slots => O(M) round-trips (N+1).
-        // Acceptable while lots are small. Upgrade path: single findBySlot_IdInAndStatusIn(...) over
-        // all lot slot ids within the window, then filter in memory.
         return List.of(
                         reservationRepository.findBySlot_IdAndStatus(slot.getId(), Status.PENDING),
                         reservationRepository.findBySlot_IdAndStatus(slot.getId(), Status.ACTIVE))
@@ -266,6 +264,9 @@ public class ReservationService {
     private void validateWindow(OffsetDateTime plannedStart, OffsetDateTime plannedEnd) {
         if (plannedStart == null || plannedEnd == null || !plannedStart.isBefore(plannedEnd)) {
             throw new BusinessValidationException("planned end must be after planned start");
+        }
+        if (plannedStart.plusDays(MAX_RESERVATION_DAYS).isBefore(plannedEnd)) {
+            throw new BusinessValidationException("planned window exceeds the maximum allowed duration");
         }
     }
 

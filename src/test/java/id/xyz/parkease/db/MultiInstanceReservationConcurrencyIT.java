@@ -31,6 +31,7 @@ class MultiInstanceReservationConcurrencyIT {
 
     private static final String POSTGRES_IMAGE = "postgres:16-alpine";
     private static final String EXCLUSION_SQL_STATE = "23P01";
+    private static final String DEADLOCK_SQL_STATE = "40P01";
     private static final String LOT_NAME = "Multi-instance Lot";
     private static final String LOT_TIMEZONE = "Asia/Jakarta";
     private static final String VEHICLE_TYPE = "CAR";
@@ -95,18 +96,22 @@ class MultiInstanceReservationConcurrencyIT {
             }
 
             int successes = 0;
-            int conflicts = 0;
+            int prevented = 0;
             for (Future<String> result : results) {
                 String sqlState = result.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
                 if (sqlState == null) {
                     successes++;
-                } else if (EXCLUSION_SQL_STATE.equals(sqlState)) {
-                    conflicts++;
+                } else if (EXCLUSION_SQL_STATE.equals(sqlState) || DEADLOCK_SQL_STATE.equals(sqlState)) {
+                    // Under high fan-out the GiST exclusion contention is resolved by
+                    // the deadlock detector (40P01) for some losers instead of a plain
+                    // exclusion violation (23P01); both prove the double-booking was
+                    // prevented at the database.
+                    prevented++;
                 }
             }
 
             assertEquals(1, successes);
-            assertEquals(INSTANCE_COUNT - 1, conflicts);
+            assertEquals(INSTANCE_COUNT - 1, prevented);
         } finally {
             executor.shutdownNow();
             assertTrue(executor.awaitTermination(TIMEOUT_SECONDS, TimeUnit.SECONDS));

@@ -10,6 +10,7 @@ import id.xyz.parkease.dto.ReservationResponse;
 import id.xyz.parkease.dto.AvailabilityResponse;
 import id.xyz.parkease.event.ReservationCheckedOutEvent;
 import id.xyz.parkease.exception.ConflictException;
+import id.xyz.parkease.exception.BusinessValidationException;
 import id.xyz.parkease.mapper.ReservationMapper;
 import id.xyz.parkease.repository.ParkingLotRepository;
 import id.xyz.parkease.repository.ParkingSlotRepository;
@@ -98,6 +99,18 @@ class ReservationServiceTest {
         assertThrows(
                 ConflictException.class,
                 () -> reservationService.createReservation(request(lot, "PLATE-2"), FIXED_NOW));
+    }
+
+    @Test
+    void createRejectsWindowExceedingMaximumDuration() {
+        ParkingLot lot = lot();
+        parkingSlotRepository.saveAndFlush(slot(lot, "A-01", 1));
+        ReservationRequest tooLong = new ReservationRequest(
+                lot.getId(), VEHICLE_TYPE, "PLATE-1", PLANNED_START, PLANNED_START.plusDays(32));
+
+        assertThrows(
+                BusinessValidationException.class,
+                () -> reservationService.createReservation(tooLong, FIXED_NOW));
     }
 
     @Test

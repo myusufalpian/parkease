@@ -1,3 +1,13 @@
 spring:
   application:
     name: parkease
+
+parkease:
+  security:
+    jwt:
+      secret: ${PARKEASE_JWT_SECRET}
+      access-token-ttl-minutes: 15
+      refresh-token-ttl-days: 7
+  billing:
+    payment-timeout-minutes: 10
+    cancellation-fee-rate: 0.10

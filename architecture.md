@@ -1,147 +1,218 @@
-# ParkEase: Architecture Overview
+# ParkEase Architecture Overview
 
-## System Overview
+## Current State
 
-ParkEase is a parking reservation and billing platform enabling drivers to reserve parking slots across multiple parking lots with automated usage-based billing. The system handles the complete reservation lifecycle: creation, deterministic slot selection, double-booking prevention, check-in/check-out, and billing with grace periods, daily caps, and promotional discounts.
+The reservation lifecycle/API, planned-time prepayment billing, payment/refund workflow via an outbox, custom JWT authentication, per-object authorization, rate-card and invoice persistence, and an append-only audit trail are implemented. Flyway migrations `V1`–`V15` back these on PostgreSQL.
 
-## Architecture Decision Highlights
+Local test evidence: the unit tier (H2) passes 163 tests; the PostgreSQL/Testcontainers tier passes 10 tests, including the exclusion-constraint and multi-instance concurrency cases. Under 20-way concurrent overlapping inserts the exclusion guard surfaces as either an exclusion violation (`23P01`) or a deadlock (`40P01`); both prove exactly one winner. This is engine-level evidence, not production load proof (see Gate conditions).
 
-### Double-Booking Prevention: PostgreSQL EXCLUDE Constraint + btree_gist
+Deferred: demand pricing, the promotions lifecycle, Redis advisory caching, rate limiting, and a production payment provider. The bundled `PaymentAdapter` is an in-process implementation excluded from the `prod` profile; production must wire a real adapter or startup fails closed.
 
-**Decision**: Use PostgreSQL `EXCLUDE` constraint with `btree_gist` extension to prevent overlapping reservations at the database level, supplemented by Redis advisory cache for fast pre-validation.
+## Approved Billing Decisions
 
-**Rationale**:
-- Moves double-booking prevention from application code to declarative database layer
-- Eliminates entire classes of bugs related to missed locking, retry logic, or deadlocks
-- Strong consistency guarantee even under concurrent load or across process boundaries
-- Redis cache remains advisory only — final truth always in PostgreSQL
+### Planned-time prepayment billing
 
-**Implementation**:
-- Constraint: `ALTER TABLE reservation ADD CONSTRAINT no_overlapping_reservations EXCLUDE USING GIST (slot_id WITH =, tstzrange(planned_start, planned_end, '[)') WITH &&) WHERE (status IN ('PENDING','ACTIVE'));`
-- Time range uses half-open interval `[start, end)` so reservation ending exactly when another starts is not overlap
-- Terminal history (`CANCELLED`, `COMPLETED`, `NO_SHOW`) never blocks new bookings
-- An `EXCLUDE` constraint cannot be handled by `ON CONFLICT` (that clause only matches unique constraints/indexes; pairing it with an exclusion constraint raises `42P10`). An overlap therefore raises SQLSTATE `23P01`, which the service catches and maps to HTTP 409.
+The invoice is created from the planned reservation interval:
 
-### Billing Engine: Usage-Based Calculation with Business Rules
+```text
+billableDuration = plannedEnd - plannedStart
+```
 
-**Design**: Duration = actualEnd - actualStart - gracePeriod (applied once at start), then segmented into calendar-day groups. Each 30-minute segment charged at (hourlyRate / 2). Daily cap per calendar day. Midnight crossings multiplied by overnight surcharge. Promo discounts clamped to subtotal.
+`actualStart` and `actualEnd` remain lifecycle/audit timestamps. They do not determine the invoice amount.
 
-**Key Rules**:
-- Grace period: applied once at beginning of actual stay, not per calendar day
-- 30-minute segments: `ceil(duration_minutes / 30)` segments per day segment
-- Daily cap: max charge per calendar day, applied after segment summation
-- Midnight crossing: each 00:00 local time transition adds overnight surcharge multiplier
-- Promo: subtotal discount clamped — total never negative
+The 30-minute grace period only controls check-in eligibility:
 
-### Promotional Discounts: Lifecycle & Quota Management
+```text
+checkInDeadline = plannedStart + 30 minutes
+```
 
-**Status Flow**: HELD (at booking) → CONSUMED (at successful check-in) → RELEASED (at pre-check-in cancellation)
+A late check-in becomes `NO_SHOW`, releases the slot, and receives no refund by default.
 
-**Rules**:
-- Promo code has scope (lot/vehicle/customer), usage_limit, effective_from/effective_to
-- Usage count incremented atomically; rejected if limit exceeded
-- HELD → CONSUMED only on check-in success; retry check-in does not reduce quota further
-- HELD → RELEASED on cancellation before check-in; quota returned idempotently
-- Cancellation after check-in does not auto-release quota (per agreed policy)
-- Discount clamped to subtotal — total invoice amount >= 0
+### Continuous 30-minute rounding
 
-### Time Handling: Canonical UTC + Lot Timezone
+The complete planned interval is rounded once:
 
-**Approach**:
-- All timestamps stored in canonical UTC in database
-- Lot timezone configured as domain field, used for calendar-day billing and midnight crossing
-- Grace period and actualStartTime/actualEndUser local time, but snapshot stored in UTC
-- Timezone conversion at boundary: UTC → lot ZoneId for calendar operations, lot ZoneId → UTC for persistence
+```text
+blocks = ceil(totalPlannedMinutes / 30)
+```
 
-### Concurrency & Fault Tolerance
+Blocks are anchored at `plannedStart`. They are assigned to the local date of their block start for daily-cap accounting. A block crossing local midnight is counted once, and each local-midnight crossing applies the configured overnight surcharge.
 
-**Redis as Advisory Cache Only**:
-- Availability pre-check via Redis (lot/slot/time-window key with TTL)
-- Cache stale results expected — always validate in PostgreSQL transaction
-- Redis outage: reservation and billing still work, falling back to PostgreSQL exclusives + exclusion constraint
-- Cache invalidation after every lifecycle mutation: create, cancel, check-in, checkout, extend
+The lot's timezone is authoritative for local dates and midnight boundaries. Persisted timestamps remain canonical UTC/`TIMESTAMP WITH TIME ZONE`.
 
-**Idempotency**:
-- Checkout and cancel operations are idempotent: re-running produces same result
-- Constraint violations mapped to HTTP 409 with consistent error format
-- Reservation status transition checked deterministically on each attempt
+### Rate-card source and snapshot
 
-### Security & Access Control
+PostgreSQL owns immutable, versioned `rate_card` rows. A published version is never edited. Booking resolves the applicable version and stores a pricing snapshot containing rate-card version, rates, cap, surcharge, currency, rounding mode, and lot timezone.
 
-**Current state (Sprint 2)**: The reservation API has **no authentication and no authorization/object-ownership checks** yet. This is a deliberate, documented deferral (auth is a Non-Goal for this phase per PRD/RFC), not an oversight. Endpoints mutate shared state and return PII (vehicle plate), so the absence of access control is a real risk **at the deployment boundary**, not in the persistence layer.
+Redis is advisory cache only. It cannot determine the final price.
 
-**Two complementary controls (both adopted):**
+Demand pricing is deferred until a later increment because occupancy metric consistency and concurrent booking behavior require separate proof.
 
-1. **Hard deployment gate (binding now)** — The reservation endpoints MUST NOT be exposed to an untrusted network until authentication + per-object authorization exist. Until then, the service is restricted to a trusted/internal network. This is an operational control (network isolation / bind to internal interface), enforced at deploy time — it does not require application code and is the compensating control that makes deferring auth safe today.
+### Cancellation and refund
 
-2. **Auth implementation task (scheduled)** — Authentication + per-object (object-ownership) authorization is a **P0 task at the start of Sprint 3, ahead of the billing engine (T18+)**. Rationale: billing generates invoices and touches money/PII; exposing that without authorization is more dangerous than reservation alone, and establishing the identity model first lets billing and promo reuse it. Audit trail (backlog T30) is pulled into this same package so pre/post-auth actions are forensically traceable.
+A paid reservation cancellation retains 10% and refunds 90%:
 
-**Design prerequisites (must be decided before auth implementation):**
-- **Identity model**: who is the principal? (customer account — which does not yet exist in the domain — vs. lot-operator vs. plate-based). This is an open decision that blocks auth design.
-- **Ownership model**: what binds a reservation to its owner for IDOR prevention (account id vs. plate).
+```text
+cancellationFee = round(totalPaid × 10%, 2)
+refundAmount = totalPaid - cancellationFee
+```
 
-**Verified positive controls (already in place)**: parameterized persistence (no SQL injection), no hardcoded production secrets, no unsafe deserialization, JSON error responses with no reflected user input (XSS sink removed), idempotent check-out/cancel (replay-safe), optimistic locking + exclusion constraint (concurrency-safe).
+Cancellation commits the reservation state change and slot release immediately. Refund processing is asynchronous through an outbox and idempotent payment adapter. Invoice history remains immutable; refund data is stored separately.
 
-**Not yet in place (edge hardening, bundle with auth before public exposure)**: rate limiting / anti-automation on booking and availability; CI action pinning by commit SHA.
+Payment timeout defaults to 10 minutes. An unpaid expired hold releases the slot.
 
-## Trade-Offs Made
+### Extension
 
-| Decision | Alternative | Why Selected |
-|---|---|---|
-| Exclusion constraint + btree_gist vs Pessimistic locks | `SELECT FOR UPDATE` | Lower contention, declarative guarantee, less custom locking code, simpler reasoning |
-| Redis advisory cache vs source of truth | Redis as primary reservation store | Avoids single point of truth complexity; Redis outage doesn't break core flow; simpler deployment |
-| Grace period once-before-segmentation vs per-day | Per-day grace application | Agreed business rule; simpler to implement and test; matches consumed promo policy |
-| Java 25 (LTS) baseline vs Java 17 floor | Stay on Spring Boot 4's Java 17 floor | Java 25 is GA/LTS with first-class Spring Boot 4 support; adopted deliberately. Java 17 is the framework floor/recommendation, not a requirement. |
-| DECIMAL monetary vs BigDecimal in JSON | Float/double | Avoid floating-point precision issues; scale 2 with HALF_UP rounding matches business requirements |
+Extension is an additional charge. The original invoice and pricing snapshot remain immutable. The extension creates a separate charge/adjustment using its own pricing decision before the extended time becomes confirmed.
 
-## Risks & Mitigations
+### Promotions
 
-| Risk | Mitigation |
-|---|---|
-| **btree_gist extension not available** in target PostgreSQL | Verify PG version (9.2+) before sprint; alternative: custom triggers if unavailable — adds ~2 days effort |
-| **Exclusion constraint performance** under high contention | Test with realistic load (Sprint 1-2); half-open intervals `[start,end)` help index usage; constraint uses btree_gist GiST index |
-| **Redis cache stale results** after lifecycle mutation | Treat cache as advisory ALWAYS; final validation in DB transaction; TTL as safety net; invalidate after every mutation |
-| **Timezone misconfiguration** leading to wrong calendar-day billing | Enforce lot timezone as required domain field; convert at boundary only; unit tests with known timezone offsets |
-| **Constraint violation error handling** not mapped to HTTP 409 | Map exclusion-violation SQLSTATE `23P01` in the service (cause-chain walk) to a consistent ErrorResponse DTO with code, message, timestamp. (`23514` is `check_violation`, a different class — the overlap guard raises `23P01`.) |
+Promo lifecycle and eligibility are outside core billing. They are implemented later with `HELD → CONSUMED → RELEASED`, quota atomicity, scope, expiry, and idempotent release. Core billing uses no promo or a validated immutable promo snapshot.
 
-## Operational Observability
+## Security and Ownership
 
-**Key Metrics to Monitor**:
-- Constraint violation attempts per day (indicates application logic bugs)
-- Reservation creation latency p95 (target: <200ms non-concurrent)
-- Concurrent booking success rate (target: 100% with exclusion constraint)
-- Redis cache hit/miss ratio for availability checks
-- Billing calculation error rate (target: 0% via fixture tests)
-- Promo quota exhaustion rate
+`CustomerAccount` is the reservation owner. Plate is vehicle data, not identity.
 
-**Logging Recommendations**:
-- Log every exclusion constraint violation (constraint name, lot_id, slot_id, time range attempt)
-- Log promo lifecycle transitions (HELD→CONSUMED, HELD→RELEASED) with reservation ID and user/correlation ID
-- Log billing calculation inputs/outputs for audit trail (rate card version, demand metric, promo snapshot)
-- Log Redis cache misses for availability checks (helps tune cache TTL)
+The ownership chain is:
 
-## Deployment Checklist
+```text
+principal → CustomerAccount → Reservation → Invoice/Refund
+```
 
-### Pre-Deployment
-- [ ] PostgreSQL version >= 9.2 with `btree_gist` extension enabled
-- [ ] Flyway migrations V1 (schema), V2 (exclusion constraint), and V3 (parking_slot.version optimistic-lock column) applied to target DB
-- [ ] Redis reachable and configured with appropriate TTL for cache keys
-- [ ] Target environment has lot timezone configured via `parkease.lot.timezone` or equivalent
+The principal is resolved from a custom JWT access token by a request filter; reservation and invoice endpoints require a valid token and check per-object access against the reservation owner (or an operator). Refresh tokens are single-use, rotated, and stored as SHA-256 hashes in the `session` table; passwords are BCrypt-hashed and bounded to 72 bytes. Login failures return a uniform response so accounts cannot be enumerated on login.
 
-### Post-Deployment Validation
-- [ ] Run concurrent booking test: 20 parallel attempts same slot/time → exactly 1 success
-- [ ] Test grace period edge case: check-in exactly at 30min boundary → ACTIVE, not NO_SHOW
-- [ ] Test billing fixture: verify the defined billing cases match expected totals
-- [ ] Test promo lifecycle: HELD→CONSUMED→RELEASED with idempotent quota
-- [ ] Verify Java toolchain: `java -version` shows 25.x (LTS baseline)
+Rate limiting and staging load/soak validation remain prerequisites for untrusted-network exposure; until those are in place the service should stay on a trusted/internal network. Registration currently distinguishes an already-registered username, which is an enumeration surface to close before public exposure.
 
-### Security Gate (blocking before untrusted-network exposure)
-- [ ] Authentication + per-object authorization implemented (Sprint 3 P0, ahead of billing), OR
-- [ ] Service confirmed restricted to a trusted/internal network (network isolation enforced and documented) if auth is not yet present
-- [ ] Rate limiting on booking + availability in place before public exposure
-- [ ] CI actions pinned by commit SHA
+## Data Components
 
-### Rollback Ready
-- [ ] Previous schema version (V1 without exclusion constraint) deployable
-- [ ] Previous app version (without constraint-aware code) can read data; writes may create overlaps resolvable manually
-- [ ] 24-hour monitoring window after enabling writes before considering rollback window closed
+Tables (Flyway `V1`–`V15`):
+
+```text
+parking_lot, parking_slot, reservation, pricing_promotion   (V1)
+customer_account, reservation_owner                          (V4)
+session                                                      (V5)
+rate_card                                                    (V6)
+parking_invoice                                              (V7)
+billing_operation                                            (V8)
+refund                                                       (V9)
+outbox_event                                                 (V10)
+extension_charge                                             (V11, payment status V14)
+audit_record                                                 (V13)
+```
+
+Important constraints (present in the migrations):
+
+```text
+EXCLUDE GIST reservation(slot_id, tstzrange(planned_start, planned_end)) WHERE status IN ('PENDING','ACTIVE')  (V2)
+UNIQUE parking_invoice(reservation_id)                     (V7)
+UNIQUE refund(payment_transaction_id)                      (V9)
+UNIQUE billing_operation(idempotency_key)                  (V8)
+UNIQUE billing_operation(reservation_id, operation_type)   (V8)
+UNIQUE rate_card(lot_id, vehicle_type, version)            (V6)
+UNIQUE customer_account(username)                          (V4)
+UNIQUE session(refresh_token_hash)                         (V5)
+CHECK  non-negative money on rate_card / parking_invoice   (V12)
+TRIGGER published rate_card is immutable                   (V12, extended V15)
+```
+
+`billing_operation` records durable operation state; it is not a generic lock table. Reservation `owner_id` binding lives in the separate `reservation_owner` join table.
+
+## Request Flows
+
+### Booking and prepayment
+
+1. Authorize customer and validate request.
+2. Begin PostgreSQL transaction.
+3. Select an available slot and resolve the immutable rate card.
+4. Calculate planned-time invoice using continuous blocks.
+5. Persist reservation, pricing snapshot, invoice `PAYMENT_PENDING`, and payment/outbox operation.
+6. Commit the slot hold.
+7. Payment adapter captures payment idempotently.
+8. On success, mark invoice `PAID`; reservation can check in.
+9. On failure or 10-minute timeout, cancel the unpaid hold and release the slot.
+
+### Check-in and checkout
+
+- Check-in validates `PENDING` plus invoice `PAID`, records actual check-in time, and changes the slot to `OCCUPIED`.
+- Late check-in becomes `NO_SHOW`, releases the slot, and receives no refund by default.
+- Checkout performs an atomic `ACTIVE → COMPLETED` transition, releases the slot, and publishes an after-commit/outbox lifecycle event. It does not recalculate the invoice.
+
+### Cancellation and refund
+
+1. Lock or atomically transition the reservation and invoice operation.
+2. Validate the paid state and idempotency key.
+3. Calculate 10% fee and 90% refund.
+4. Mark reservation cancelled and slot available in one transaction.
+5. Create refund record and outbox command.
+6. Process and reconcile provider result asynchronously.
+
+## Consistency and Idempotency
+
+- PostgreSQL exclusion constraint remains the source of truth for overlapping reservation windows.
+- Invoice creation is protected by `UNIQUE(reservation_id)`.
+- State transitions use conditional updates or row locks and verify affected-row count.
+- Payment/refund/outbox operations use durable idempotency keys.
+- No generic application lock is required for multi-instance correctness.
+
+## API Contracts
+
+- `POST /api/v1/reservations` returns reservation, invoice, and payment status.
+- `POST /api/v1/reservations/{id}/check-out` completes lifecycle only; invoice already exists.
+- `DELETE /api/v1/reservations/{id}` returns cancellation fee, refund amount, and refund status.
+- `GET /api/v1/invoices/{reservationId}` requires owner/operator authorization.
+
+## Observability and SLO
+
+These are target metrics, not yet proven. Metrics, traces, and alerts are not wired, and no staging load/soak has validated them; treat them as gate criteria rather than achieved results.
+
+Target metrics:
+
+- availability/create p95 ≤ 300 ms;
+- checkout persistence p95 ≤ 500 ms;
+- invoice GET p95 ≤ 200 ms;
+- cancellation acknowledgement p95 ≤ 300 ms;
+- 99.5% initial monthly API availability;
+- zero duplicate invoices;
+- zero completed reservations without invoices;
+- 100% deterministic billing fixture accuracy;
+- RPO ≤ 5 minutes and RTO ≤ 30 minutes.
+
+Logs and audit records include correlation ID, actor, reservation, invoice/refund IDs, operation, result, latency, pricing version, and error code. Plate and payment data are masked.
+
+## Options and Decision
+
+### Option A — Transactional database core plus unique constraints and outbox (selected)
+
+Reservation/invoice/refund state is committed transactionally. External payment and audit side effects use an outbox. Unique constraints and operation records provide idempotency.
+
+This is selected for the first billing increment because it is easiest to prove with PostgreSQL and preserves strong consistency without introducing a fully asynchronous invoice experience.
+
+### Option B — Fully asynchronous event-driven billing
+
+Checkout or booking emits events and a separate billing consumer creates invoices eventually. This improves independent scaling but introduces `PAYMENT_PENDING`, `INVOICE_PENDING`, reconciliation, and eventual consistency throughout the customer API. Deferred for now.
+
+### Option C — Generic lock table
+
+Rejected as the primary concurrency mechanism. It introduces stale-lock cleanup and deadlock risks and does not replace database uniqueness. A purpose-built `billing_operation` table is retained only for durable idempotency state.
+
+## Deployment and Recovery
+
+Migrations are additive: customer account, rate card, invoice, payment/refund, operation, and outbox tables are introduced before application writes depend on them. Invoice and refund data are never destructively rolled back; recovery uses forward fixes, backup/restore, and reconciliation.
+
+Before public exposure:
+
+Satisfied now:
+
+- authentication and per-object authorization are active;
+- the PostgreSQL integration tier is green and can be made merge-blocking;
+- payment/refund side effects run through the outbox with durable idempotency keys, and invoice/refund data is never destructively rolled back.
+
+Outstanding (gate conditions):
+
+- rate limiting is active;
+- a production payment adapter is wired (the in-process adapter is `prod`-excluded and startup fails closed without a real one);
+- registration no longer reveals whether a username exists;
+- metrics, traces, alerts, and payment/refund failure runbooks are wired and tested;
+- published `rate_card` is protected at the role level (revoke UPDATE and trigger management from runtime DB roles so the immutability trigger cannot be disabled);
+- CI actions are SHA-pinned;
+- staging load/soak validates the SLOs.
