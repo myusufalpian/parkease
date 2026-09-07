@@ -1,5 +1,7 @@
 package id.xyz.parkease.db;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import id.xyz.parkease.domain.ParkingLot;
 import id.xyz.parkease.domain.ParkingSlot;
 import id.xyz.parkease.domain.Reservation;
@@ -15,6 +17,7 @@ import org.springframework.transaction.annotation.Transactional;
 import org.testcontainers.containers.PostgreSQLContainer;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @SpringBootTest
 @Tag("postgres")
@@ -84,8 +87,31 @@ class PostgresJpaPersistenceIT {
         assertNotNull(loadedLot);
         assertNotNull(loadedSlot);
         assertNotNull(loadedReservation);
-        assertEquals(OPERATING_HOURS, loadedLot.getOperatingHours());
-        assertEquals(Long.valueOf(0), loadedSlot.getVersion());
-        assertEquals(PRICING_SNAPSHOT, loadedReservation.getPricingSnapshotJson());
+        assertJsonEquals(OPERATING_HOURS, loadedLot.getOperatingHours());
+        assertNotNull(loadedSlot.getVersion());
+        Long persistedVersion = loadedSlot.getVersion();
+
+        ParkingSlot updatedSlot = loadedSlot.markOccupied();
+        entityManager.merge(updatedSlot);
+        entityManager.flush();
+        entityManager.clear();
+
+        ParkingSlot reloadedSlot = entityManager.find(ParkingSlot.class, slot.getId());
+        assertNotNull(reloadedSlot);
+        assertEquals(ParkingSlot.SlotStatus.OCCUPIED, reloadedSlot.getStatus());
+        assertNotNull(reloadedSlot.getVersion());
+        assertTrue(reloadedSlot.getVersion() > persistedVersion);
+        assertJsonEquals(PRICING_SNAPSHOT, loadedReservation.getPricingSnapshotJson());
+    }
+
+    private static void assertJsonEquals(String expectedJson, String actualJson) {
+        ObjectMapper mapper = new ObjectMapper();
+        try {
+            JsonNode expected = mapper.readTree(expectedJson);
+            JsonNode actual = mapper.readTree(actualJson);
+            assertEquals(expected, actual);
+        } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
+            throw new AssertionError("invalid JSON in round-trip assertion", e);
+        }
     }
 }

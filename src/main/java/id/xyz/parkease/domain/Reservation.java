@@ -132,6 +132,11 @@ public class Reservation {
         return toBuilder().status(Status.CANCELLED).cancellationReason(reason).lateCancellation(late).updatedAt(OffsetDateTime.now()).build();
     }
 
+    public Reservation extendTo(OffsetDateTime newPlannedEnd) {
+        Objects.requireNonNull(newPlannedEnd, "newPlannedEnd must not be null");
+        return toBuilder().plannedEnd(newPlannedEnd).updatedAt(OffsetDateTime.now()).build();
+    }
+
     @PrePersist
     void applyDefaults() {
         if (id == null) {
