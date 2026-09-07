@@ -2,7 +2,9 @@ package id.xyz.parkease.security;
 
 import id.xyz.parkease.config.JwtProperties;
 import id.xyz.parkease.domain.CustomerAccount;
+import id.xyz.parkease.domain.CustomerAccount.AccountStatus;
 import id.xyz.parkease.domain.CustomerAccount.Role;
+import id.xyz.parkease.repository.CustomerAccountRepository;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.ServletRequest;
@@ -19,6 +21,8 @@ import org.springframework.mock.web.MockHttpServletResponse;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 class JwtAuthenticationFilterTest {
 
@@ -43,12 +47,18 @@ class JwtAuthenticationFilterTest {
         return CustomerAccount.builder().username("driver1").passwordHash("hash").role(Role.CUSTOMER).build();
     }
 
+    private CustomerAccountRepository accountRepository(CustomerAccount account) {
+        CustomerAccountRepository repository = mock(CustomerAccountRepository.class);
+        when(repository.findById(account.getId())).thenReturn(java.util.Optional.of(account));
+        return repository;
+    }
+
     @Test
     void validBearerTokenSetsPrincipalAttributeAndContinuesChain() throws ServletException, IOException {
         JwtTokenService jwtTokenService = jwtTokenService();
         CustomerAccount account = account();
         String token = jwtTokenService.issueAccessToken(account);
-        JwtAuthenticationFilter filter = new JwtAuthenticationFilter(jwtTokenService);
+        JwtAuthenticationFilter filter = new JwtAuthenticationFilter(jwtTokenService, accountRepository(account));
 
         MockHttpServletRequest request = new MockHttpServletRequest("GET", "/api/v1/reservations");
         request.addHeader("Authorization", "Bearer " + token);
@@ -65,7 +75,7 @@ class JwtAuthenticationFilterTest {
 
     @Test
     void missingAuthorizationHeaderReturns401AndDoesNotContinueChain() throws ServletException, IOException {
-        JwtAuthenticationFilter filter = new JwtAuthenticationFilter(jwtTokenService());
+        JwtAuthenticationFilter filter = new JwtAuthenticationFilter(jwtTokenService(), mock(CustomerAccountRepository.class));
         MockHttpServletRequest request = new MockHttpServletRequest("GET", "/api/v1/reservations");
         MockHttpServletResponse response = new MockHttpServletResponse();
         RecordingFilterChain filterChain = new RecordingFilterChain();
@@ -79,7 +89,7 @@ class JwtAuthenticationFilterTest {
 
     @Test
     void malformedAuthorizationHeaderReturns401() throws ServletException, IOException {
-        JwtAuthenticationFilter filter = new JwtAuthenticationFilter(jwtTokenService());
+        JwtAuthenticationFilter filter = new JwtAuthenticationFilter(jwtTokenService(), mock(CustomerAccountRepository.class));
         MockHttpServletRequest request = new MockHttpServletRequest("GET", "/api/v1/reservations");
         request.addHeader("Authorization", "not-bearer-token");
         MockHttpServletResponse response = new MockHttpServletResponse();
@@ -93,7 +103,7 @@ class JwtAuthenticationFilterTest {
 
     @Test
     void shouldNotFilterAllowsPublicRoutes() {
-        JwtAuthenticationFilter filter = new JwtAuthenticationFilter(jwtTokenService());
+        JwtAuthenticationFilter filter = new JwtAuthenticationFilter(jwtTokenService(), mock(CustomerAccountRepository.class));
 
         MockHttpServletRequest authRequest = new MockHttpServletRequest("POST", "/api/v1/auth/login");
         MockHttpServletRequest availabilityRequest = new MockHttpServletRequest("GET", "/api/v1/lots/" + UUID.randomUUID() + "/availability");
@@ -106,9 +116,25 @@ class JwtAuthenticationFilterTest {
 
     @Test
     void shouldFilterProtectedRoutes() {
-        JwtAuthenticationFilter filter = new JwtAuthenticationFilter(jwtTokenService());
+        JwtAuthenticationFilter filter = new JwtAuthenticationFilter(jwtTokenService(), mock(CustomerAccountRepository.class));
         MockHttpServletRequest bookingRequest = new MockHttpServletRequest("POST", "/api/v1/reservations");
 
         assertFalse(filter.shouldNotFilter(bookingRequest));
+    }
+
+    @Test
+    void disabledAccountTokenReturns401AndDoesNotContinueChain() throws ServletException, IOException {
+        JwtTokenService jwtTokenService = jwtTokenService();
+        CustomerAccount account = account().toBuilder().status(AccountStatus.DISABLED).build();
+        JwtAuthenticationFilter filter = new JwtAuthenticationFilter(jwtTokenService, accountRepository(account));
+        MockHttpServletRequest request = new MockHttpServletRequest("GET", "/api/v1/reservations");
+        request.addHeader("Authorization", "Bearer " + jwtTokenService.issueAccessToken(account));
+        MockHttpServletResponse response = new MockHttpServletResponse();
+        RecordingFilterChain filterChain = new RecordingFilterChain();
+
+        filter.doFilterInternal(request, response, filterChain);
+
+        assertFalse(filterChain.invoked);
+        assertEquals(401, response.getStatus());
     }
 }

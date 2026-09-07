@@ -1,6 +1,44 @@
 spring:
   application:
     name: parkease
+  profiles:
+    default: docker
+  datasource:
+    url: ${SPRING_DATASOURCE_URL}
+    username: ${SPRING_DATASOURCE_USERNAME}
+    password: ${SPRING_DATASOURCE_PASSWORD}
+    driver-class-name: org.postgresql.Driver
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+  flyway:
+    enabled: true
+  data:
+    redis:
+      host: ${SPRING_DATA_REDIS_HOST:localhost}
+      port: ${SPRING_DATA_REDIS_PORT:6379}
+  jackson:
+    time-zone: UTC
+
+server:
+  port: ${SERVER_PORT:8080}
+  shutdown: graceful
+  forward-headers-strategy: none
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      probes:
+        enabled: true
 
 parkease:
   security:
@@ -9,5 +47,5 @@ parkease:
       access-token-ttl-minutes: 15
       refresh-token-ttl-days: 7
   billing:
-    payment-timeout-minutes: 10
-    cancellation-fee-rate: 0.10
+    payment-timeout-minutes: ${PARKEASE_PAYMENT_TIMEOUT_MINUTES:10}
+    cancellation-fee-rate: ${PARKEASE_CANCELLATION_FEE_RATE:0.10}

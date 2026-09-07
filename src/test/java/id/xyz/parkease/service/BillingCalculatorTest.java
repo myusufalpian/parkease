@@ -2,6 +2,7 @@ package id.xyz.parkease.service;
 
 import id.xyz.parkease.domain.ParkingLot;
 import id.xyz.parkease.domain.RateCard;
+import id.xyz.parkease.domain.PricingPromotion;
 import id.xyz.parkease.dto.BillingBreakdown;
 import id.xyz.parkease.exception.BusinessValidationException;
 import java.math.BigDecimal;
@@ -126,5 +127,44 @@ class BillingCalculatorTest {
                 OffsetDateTime.parse("2024-01-15T09:00:00+07:00"),
                 OffsetDateTime.parse("2024-01-15T09:30:00+07:00"),
                 JAKARTA, null));
+    }
+
+    @Test
+    void percentagePromotionDiscountsSubtotalAndUpdatesSnapshot() {
+        BillingBreakdown breakdown = calculator.calculate(
+                OffsetDateTime.parse("2024-01-15T09:00:00+07:00"),
+                OffsetDateTime.parse("2024-01-15T10:00:00+07:00"), JAKARTA, rateCard());
+        PricingPromotion promotion = PricingPromotion.builder()
+                .code("PROMO10")
+                .effectiveFrom(OffsetDateTime.parse("2024-01-01T00:00:00+07:00"))
+                .effectiveTo(OffsetDateTime.parse("2024-02-01T00:00:00+07:00"))
+                .discountType(PricingPromotion.DiscountType.PERCENTAGE)
+                .discountValue(new BigDecimal("10"))
+                .build();
+
+        BillingBreakdown discounted = calculator.applyPromotion(breakdown, promotion);
+
+        assertEquals(new BigDecimal("1000.00"), discounted.discountAmount());
+        assertEquals(new BigDecimal("9000.00"), discounted.total());
+        assertEquals("PROMO10", discounted.pricingSnapshot().promoCode());
+    }
+
+    @Test
+    void fixedPromotionCannotReduceTotalBelowZero() {
+        BillingBreakdown breakdown = calculator.calculate(
+                OffsetDateTime.parse("2024-01-15T09:00:00+07:00"),
+                OffsetDateTime.parse("2024-01-15T09:30:00+07:00"), JAKARTA, rateCard());
+        PricingPromotion promotion = PricingPromotion.builder()
+                .code("FREE")
+                .effectiveFrom(OffsetDateTime.parse("2024-01-01T00:00:00+07:00"))
+                .effectiveTo(OffsetDateTime.parse("2024-02-01T00:00:00+07:00"))
+                .discountType(PricingPromotion.DiscountType.FIXED)
+                .discountValue(new BigDecimal("999999"))
+                .build();
+
+        BillingBreakdown discounted = calculator.applyPromotion(breakdown, promotion);
+
+        assertEquals(new BigDecimal("5000.00"), discounted.discountAmount());
+        assertEquals(new BigDecimal("0.00"), discounted.total());
     }
 }

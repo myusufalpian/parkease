@@ -92,10 +92,7 @@ public class PricingPromotion {
         FIXED
     }
 
-    public enum PromoStatus {
-        ACTIVE,
-        EXPIRED
-    }
+    public enum PromoStatus { ACTIVE, EXPIRED }
 
     @PrePersist
     void applyDefaults() {
@@ -116,4 +113,5 @@ public class PricingPromotion {
     public PricingPromotion consume() {
         return toBuilder().usageCount(usageCount + 1).updatedAt(OffsetDateTime.now()).build();
     }
+
 }

@@ -13,10 +13,13 @@ Parking reservation platform: reserve parking slots across multiple lots with da
 - **Extend** — updates the planned end time (conflict-checked against the same slot) and raises a separate additional charge that must be paid before the extended window is usable.
 - **Availability** — lists available slots for a lot and time window (no authentication required).
 - **Billing engine** — planned-time prepayment with continuous 30-minute rounding; invoices, refunds, and payment references are persisted. Payment is captured through a `PaymentAdapter` port; an outbox dispatcher publishes payment/refund events and a reconciler expires unpaid invoices past a timeout. State transitions are guarded so a capture and a timeout cannot both win.
+- **Promotions** — eligible promotions are validated against lot, vehicle, customer type, and effective period. Usage is held at booking, consumed after successful check-in, and released when the reservation is cancelled or expires.
+- **Demand pricing** — active demand rules adjust the rate card from occupancy for the requested lot, vehicle type, and time window. The result is stored in the invoice pricing snapshot.
+- **Authentication hardening** — disabled accounts cannot use existing access tokens, and login/register requests are rate-limited for the single-instance deployment target.
 
 ### Not implemented
 
-- Promotions lifecycle and demand pricing, Redis advisory cache wiring, rate limiting, multi-region, mobile clients, admin dashboard.
+- Redis advisory cache wiring, distributed rate limiting, multi-region deployment, mobile clients, and admin dashboard.
 - A production payment provider: the bundled `PaymentAdapter` is an in-process implementation restricted to non-production profiles. In the `prod` profile a real adapter must be wired or startup fails closed (see `architecture.md`).
 
 ## API contract (`/api/v1`)
@@ -37,7 +40,7 @@ Errors return `{ timestamp, status, code, message }` with no stack traces or int
 | `GET` | `/invoices/{reservationId}` | required (owner/operator) | 200 | 401, 403, 404 |
 | `GET` | `/lots/{lotId}/availability?start=&end=&vehicleType=` | public | 200 | 400, 404, 422 |
 
-**Auth requests**: register/login `{ username (3–100), password (8–72 bytes) }`; refresh/logout `{ refreshToken (≤256) }`. **Auth response**: `{ accessToken, refreshToken }`. Device and client IP are taken from the `User-Agent` header (capped at 500 chars) and the remote address.
+**Auth requests**: register/login `{ username (3–100), password (8–72 bytes) }`; refresh/logout `{ refreshToken (≤256) }`. **Auth response**: `{ accessToken, refreshToken, expiresIn }`. Device information is parsed from the `User-Agent` header (capped at 500 chars); client IP uses the servlet remote address.
 
 **Request (`POST /reservations`)**: `{ lotId (UUID), vehicleType (≤50), plate (≤20), plannedStart, plannedEnd }` (ISO offset date-time; end after start; window within the maximum duration). Returns a `BookingResponse` carrying the reservation and its invoice.
 
@@ -47,7 +50,51 @@ Errors return `{ timestamp, status, code, message }` with no stack traces or int
 
 **Error codes**: `INVALID_REQUEST` (400), `RESOURCE_NOT_FOUND` (404), `CONFLICT` (409), `BUSINESS_VALIDATION_FAILED` (422), `INTERNAL_ERROR` (500). Authentication failures return 401; ownership failures return 403.
 
-**Event**: `ReservationCheckedOutEvent(reservationId, actualEnd)` published on successful check-out (exactly once; not re-published on checkout retry).
+### Endpoint details
+
+All request and response bodies use JSON. Date-time values use ISO-8601 offset date-time; identifiers use UUID unless stated otherwise. Protected routes require `Authorization: Bearer <accessToken>`.
+
+#### Authentication
+
+| Endpoint | Request body | Response |
+|---|---|---|
+| `POST /api/v1/auth/register` | `{ "username": "driver1", "password": "strong-password" }` | `201` with `AuthResponse` |
+| `POST /api/v1/auth/login` | `{ "username": "driver1", "password": "strong-password" }` | `200` with `AuthResponse` |
+| `POST /api/v1/auth/refresh` | `{ "refreshToken": "..." }` | `200` with rotated `AuthResponse` |
+| `POST /api/v1/auth/logout` | `{ "refreshToken": "..." }` | `200` with an empty body |
+
+`AuthResponse` is `{ accessToken, refreshToken, accessTokenExpiresInSeconds }`. Username length is 3–100 characters, password length is 8–72 UTF-8 bytes, and refresh tokens are limited to 256 characters. Login and registration are rate-limited per client IP for the single-instance deployment target.
+
+#### Reservations and billing
+
+| Endpoint | Request | Response |
+|---|---|---|
+| `POST /api/v1/reservations` | `ReservationRequest` | `201 BookingResponse` |
+| `POST /api/v1/reservations/{reservationId}/check-in` | no body | `200 ReservationResponse` |
+| `POST /api/v1/reservations/{reservationId}/check-out` | no body | `200 ReservationResponse` |
+| `DELETE /api/v1/reservations/{reservationId}` | optional `{ "reason": "..." }` | `200 CancellationResponse` |
+| `PUT /api/v1/reservations/{reservationId}/extend` | `{ "plannedEnd": "2026-09-08T12:00:00Z" }` | `200 ExtensionChargeResponse` |
+| `GET /api/v1/invoices/{reservationId}` | no body | `200 InvoiceResponse` |
+
+`ReservationRequest` is `{ lotId, vehicleType, plate, plannedStart, plannedEnd, promoCode? }`. `vehicleType` is limited to 50 characters, `plate` to 20 characters, and `promoCode` to 50 characters; `plannedEnd` must be after `plannedStart`.
+
+`ReservationResponse` contains `{ id, status, slot, plate, plannedStart, plannedEnd, actualStart, actualEnd, cancellationReason, lateCancellation }`. The nested `slot` contains `{ id, slotId, vehicleType, floor }`.
+
+`BookingResponse` contains `{ reservation: ReservationResponse, invoice: InvoiceResponse }`. `InvoiceResponse` contains `{ id, reservationId, durationMinutes, subtotal, discountAmount, total, currency, paymentStatus, generatedAt, paidAt }`.
+
+`CancellationResponse` contains `{ reservation, refundStatus, cancellationFee, refundAmount }`. `ExtensionChargeResponse` contains `{ reservation, additionalDurationMinutes, amount, currency }`.
+
+Reservation mutations and invoice reads require the reservation owner, operator, or administrator role. Booking creates the invoice and payment workflow atomically; check-in requires a paid invoice; check-out is idempotent; extension requires its additional charge to be paid before the extended period is usable.
+
+#### Availability
+
+`GET /api/v1/lots/{lotId}/availability?start={isoDateTime}&end={isoDateTime}&vehicleType={vehicleType}` is public. The response is `AvailabilityResponse`: `{ lotId, plannedStart, plannedEnd, slots }`, where each slot is `{ id, slotId, vehicleType, floor }`. `vehicleType` is optional.
+
+#### Errors and events
+
+Errors use `{ timestamp, status, code, message }` and never expose stack traces. Validation and malformed JSON return `400`; authentication failures return `401`; ownership failures return `403`; missing resources return `404`; overlap or state conflicts return `409`; business validation failures return `422`; unexpected failures return `500`.
+
+`ReservationCheckedOutEvent(reservationId, actualEnd)` is published after a successful check-out and is not republished for an idempotent retry.
 
 ## Technology
 
@@ -57,7 +104,7 @@ Errors return `{ timestamp, status, code, message }` with no stack traces or int
 | Spring Boot | 4.1.1 (Spring Framework 7, Jakarta EE 11, Hibernate ORM 7) |
 | Build | Gradle 9.7.1 (wrapper) |
 | Database | PostgreSQL (Flyway migrations, `btree_gist`) |
-| Cache | Redis (advisory only; not yet wired) |
+| Cache | Redis (available in Docker Compose; not authoritative) |
 | Auth | Custom JWT via `io.jsonwebtoken:jjwt` 0.13.0 (HS256); BCrypt via `spring-security-crypto` |
 | Device parsing | `com.github.ua-parser:uap-java` 1.6.1 |
 | JSON | Jackson databind + `jackson-datatype-jsr310` (JSR-310) |
@@ -67,7 +114,8 @@ Errors return `{ timestamp, status, code, message }` with no stack traces or int
 
 ```
 domain/       JPA entities + state transitions (Reservation, ParkingSlot, ParkingLot, PricingPromotion,
-              CustomerAccount, Session, ReservationOwner, RateCard, ParkingInvoice, BillingOperation,
+              PromotionHold, DemandPricingRule, CustomerAccount, Session, ReservationOwner, RateCard,
+              ParkingInvoice, BillingOperation,
               Refund, OutboxEvent, ExtensionCharge, AuditRecord)
 repository/   Spring Data JPA repositories
 service/      ReservationService (lifecycle); AuthService + AuthorizationService; billing services
@@ -76,7 +124,7 @@ service/      ReservationService (lifecycle); AuthService + AuthorizationService
               InProcessPaymentAdapter; OutboxDispatcher, PaymentTimeoutReconciler; AuditService
 controller/   ReservationController, AuthController, BillingController (REST)
 security/     JwtTokenService, JwtAuthenticationFilter, RefreshTokenGenerator, DeviceInfoParser,
-              AuthenticatedPrincipal
+              AuthenticatedPrincipal, AuthRateLimiter
 exception/    ApiException hierarchy + ApiExceptionHandler (@RestControllerAdvice)
 mapper/       ReservationMapper, PricingSnapshotMapper, InvoiceMapper, PaymentReferenceSnapshotMapper
 dto/          request/response records
@@ -89,18 +137,22 @@ Request/data flow: controller (`@Valid` DTO, principal resolved from the JWT fil
 
 ## Database
 
-Flyway migrations `V1`–`V15` (PostgreSQL, `btree_gist`):
+Flyway migrations `V1`–`V16` (PostgreSQL, `btree_gist`):
 
 - Reservation core: `parking_lot`, `parking_slot`, `reservation`, `pricing_promotion` (`V1`); overlap-guard exclusion constraint (`V2`); `parking_slot.version` optimistic lock (`V3`).
 - Overlap guard (`V2`): `EXCLUDE USING GIST (slot_id WITH =, tstzrange(planned_start, planned_end, '[)') WITH &&) WHERE (status IN ('PENDING','ACTIVE'))` — touching endpoints allowed; `CANCELLED`/`COMPLETED`/`NO_SHOW` history never blocks new bookings.
 - Auth: `customer_account` + `reservation_owner` (`V4`), `session` (`V5`).
 - Billing: `rate_card` (`V6`), `parking_invoice` (`V7`), `billing_operation` (`V8`), `refund` (`V9`), `outbox_event` (`V10`), `extension_charge` (`V11`, payment status in `V14`), billing integrity constraints (`V12`), `audit_record` (`V13`), rate-card immutability trigger (`V12`, extended in `V15`).
+- Promotions: `promotion_hold` (`V16`) tracks held, consumed, and released promotion usage.
+- Demand pricing: `demand_pricing_rule` stores active occupancy thresholds and multipliers.
 
 ## Setup / run / test / build
 
 - Unit tests (H2 tier): `./gradlew test`
 - Coverage: `./gradlew test jacocoTestReport` → `build/reports/jacoco/test/html/index.html`
 - PostgreSQL integration tests (exclusion constraint, JSONB round-trip, version invariant, multi-instance concurrency, lifecycle, outbox): `./gradlew postgresIntegrationTest` — **requires Docker**; skipped automatically when Docker is unavailable.
+- Docker Compose: copy `.env.example` to `.env`, set a strong `PARKEASE_JWT_SECRET`, then run `docker compose up --build`. The setup runs one app instance with PostgreSQL and Redis readiness checks.
+- Runtime image: `Dockerfile` uses a multi-stage build, Spring Boot layers, `jdeps`, and `jlink`; the final container runs as a non-root user with a read-only filesystem.
 
 Configuration requires a JWT signing secret (see `JwtProperties`) and billing settings (see `BillingProperties`); the test configuration supplies deterministic values.
 
@@ -117,6 +169,8 @@ Configuration requires a JWT signing secret (see `JwtProperties`) and billing se
 - Custom JWT (HS256) access tokens with refresh-token rotation backed by a `session` table; refresh tokens are stored as SHA-256 hashes. Passwords are BCrypt-hashed and bounded to 72 bytes.
 - Per-object authorization: reservation and invoice access is checked against the reservation owner.
 - Login failures return a uniform response (no account enumeration on login).
+- Login and registration are limited to 10 requests per minute per client IP and operation for the single-instance deployment target.
+- Forwarded proxy headers are not trusted by default; configure a trusted proxy explicitly before changing this behavior.
 - The in-process payment adapter is disabled in the `prod` profile; production must wire a real adapter or startup fails closed.
 - Persistence is parameterized (no injection); reservations store a vehicle plate (PII). Deploy/security gate is documented in `architecture.md`.
 

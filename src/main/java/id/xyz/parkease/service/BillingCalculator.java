@@ -1,6 +1,7 @@
 package id.xyz.parkease.service;
 
 import id.xyz.parkease.domain.RateCard;
+import id.xyz.parkease.domain.PricingPromotion;
 import id.xyz.parkease.dto.BillingBreakdown;
 import id.xyz.parkease.dto.PricingSnapshot;
 import id.xyz.parkease.exception.BusinessValidationException;
@@ -28,6 +29,11 @@ public class BillingCalculator {
 
     public BillingBreakdown calculate(
             OffsetDateTime plannedStart, OffsetDateTime plannedEnd, ZoneId lotTimezone, RateCard rateCard) {
+        return calculate(plannedStart, plannedEnd, lotTimezone, rateCard, null);
+    }
+
+    public BillingBreakdown calculate(
+            OffsetDateTime plannedStart, OffsetDateTime plannedEnd, ZoneId lotTimezone, RateCard rateCard, String demandMetric) {
         Objects.requireNonNull(plannedStart, "plannedStart must not be null");
         Objects.requireNonNull(plannedEnd, "plannedEnd must not be null");
         Objects.requireNonNull(lotTimezone, "lotTimezone must not be null");
@@ -56,7 +62,7 @@ public class BillingCalculator {
 
         PricingSnapshot snapshot = new PricingSnapshot(
                 rateCard.getVersion(),
-                null,
+                demandMetric,
                 null,
                 rateCard.getHourlyRate(),
                 rateCard.getDailyCap(),
@@ -64,6 +70,19 @@ public class BillingCalculator {
                 rateCard.getOvernightSurcharge());
 
         return new BillingBreakdown(durationMinutes, subtotal, discountAmount, total, rateCard.getCurrency(), snapshot);
+    }
+
+    public BillingBreakdown applyPromotion(BillingBreakdown breakdown, PricingPromotion promotion) {
+        if (promotion == null) return breakdown;
+        BigDecimal discount = promotion.getDiscountType() == PricingPromotion.DiscountType.PERCENTAGE
+                ? breakdown.subtotal().multiply(promotion.getDiscountValue()).divide(new BigDecimal("100"), MONEY_SCALE, RoundingMode.HALF_UP)
+                : promotion.getDiscountValue();
+        discount = discount.max(BigDecimal.ZERO).min(breakdown.subtotal()).setScale(MONEY_SCALE, RoundingMode.HALF_UP);
+        PricingSnapshot snapshot = new PricingSnapshot(breakdown.pricingSnapshot().rateCardVersion(), null,
+                promotion.getCode(), breakdown.pricingSnapshot().hourlyRate(), breakdown.pricingSnapshot().dailyCap(),
+                breakdown.pricingSnapshot().graceMinutes(), breakdown.pricingSnapshot().overnightSurcharge());
+        return new BillingBreakdown(breakdown.durationMinutes(), breakdown.subtotal(), discount,
+                breakdown.total().subtract(discount).setScale(MONEY_SCALE, RoundingMode.HALF_UP), breakdown.currency(), snapshot);
     }
 
     private Map<LocalDate, BigDecimal> allocateBlocksToLocalDates(

@@ -6,6 +6,7 @@ import java.time.OffsetDateTime;
 import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import java.math.BigDecimal;
 
 class DomainValidationTest {
 
@@ -48,5 +49,18 @@ class DomainValidationTest {
                 .build();
 
         assertFalse(validator.validate(reservation).isEmpty());
+    }
+
+    @Test
+    void demandPricingRuleRejectsInvalidWindowAndMultiplier() {
+        DemandPricingRule rule = DemandPricingRule.builder()
+                .lot(ParkingLot.builder().name(LOT_NAME).timezone(TIMEZONE).build())
+                .effectiveFrom(OffsetDateTime.parse("2024-02-01T00:00:00+07:00"))
+                .effectiveTo(OffsetDateTime.parse("2024-01-01T00:00:00+07:00"))
+                .occupancyThreshold(new BigDecimal("1.2"))
+                .multiplier(BigDecimal.ZERO)
+                .build();
+
+        assertFalse(validator.validate(rule).isEmpty());
     }
 }
