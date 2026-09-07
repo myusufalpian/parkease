@@ -20,4 +20,6 @@ public interface ParkingSlotRepository extends JpaRepository<ParkingSlot, UUID> 
             @Param("lotId") UUID lotId,
             @Param("vehicleType") String vehicleType,
             @Param("status") SlotStatus status);
+
+    long countByLot_IdAndVehicleType(UUID lotId, String vehicleType);
 }

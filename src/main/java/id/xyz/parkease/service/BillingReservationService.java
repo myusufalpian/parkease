@@ -8,6 +8,7 @@ import id.xyz.parkease.domain.OutboxEvent;
 import id.xyz.parkease.domain.OutboxEvent.EventType;
 import id.xyz.parkease.domain.ParkingInvoice;
 import id.xyz.parkease.domain.ParkingLot;
+import id.xyz.parkease.domain.PricingPromotion;
 import id.xyz.parkease.domain.RateCard;
 import id.xyz.parkease.domain.Reservation;
 import id.xyz.parkease.domain.ReservationOwner;
@@ -59,6 +60,8 @@ public class BillingReservationService {
     private final ReservationMapper reservationMapper;
     private final InvoiceMapper invoiceMapper;
     private final AuditService auditService;
+    private final PromotionService promotionService;
+    private final DemandPricingService demandPricingService;
     private final Clock clock;
 
     public BillingReservationService(
@@ -77,6 +80,8 @@ public class BillingReservationService {
             ReservationMapper reservationMapper,
             InvoiceMapper invoiceMapper,
             AuditService auditService,
+            PromotionService promotionService,
+            DemandPricingService demandPricingService,
             Clock clock) {
         this.reservationService = Objects.requireNonNull(reservationService);
         this.parkingLotRepository = Objects.requireNonNull(parkingLotRepository);
@@ -93,6 +98,8 @@ public class BillingReservationService {
         this.reservationMapper = Objects.requireNonNull(reservationMapper);
         this.invoiceMapper = Objects.requireNonNull(invoiceMapper);
         this.auditService = Objects.requireNonNull(auditService);
+        this.promotionService = Objects.requireNonNull(promotionService);
+        this.demandPricingService = Objects.requireNonNull(demandPricingService);
         this.clock = Objects.requireNonNull(clock);
     }
 
@@ -106,7 +113,10 @@ public class BillingReservationService {
         Reservation reservation = reservationRepository.findById(reservationResponse.id())
                 .orElseThrow(() -> new ResourceNotFoundException("reservation was not found"));
 
-        assignOwner(reservation, principal);
+        CustomerAccount owner = assignOwner(reservation, principal);
+        ParkingLot lot = parkingLotRepository.findById(request.lotId())
+                .orElseThrow(() -> new ResourceNotFoundException("parking lot was not found"));
+        promotionService.hold(request.promoCode(), reservation, request.vehicleType(), lot.getId(), owner.getCustomerType());
         ParkingInvoice invoice = createInvoice(request, reservation, requestedAt);
         auditService.record(
                 principal.customerAccountId(),
@@ -119,13 +129,14 @@ public class BillingReservationService {
         return new BookingResponse(reservationResponse, invoiceMapper.toResponse(invoice));
     }
 
-    private void assignOwner(Reservation reservation, AuthenticatedPrincipal principal) {
+    private CustomerAccount assignOwner(Reservation reservation, AuthenticatedPrincipal principal) {
         CustomerAccount owner = customerAccountRepository.findById(principal.customerAccountId())
                 .orElseThrow(() -> new ResourceNotFoundException("customer account was not found"));
         reservationOwnerRepository.save(ReservationOwner.builder()
                 .reservation(reservation)
                 .customerAccount(owner)
                 .build());
+        return owner;
     }
 
     private ParkingInvoice createInvoice(ReservationRequest request, Reservation reservation, OffsetDateTime requestedAt) {
@@ -133,8 +144,12 @@ public class BillingReservationService {
                 .orElseThrow(() -> new ResourceNotFoundException("parking lot was not found"));
         ZoneId lotTimezone = ZoneId.of(lot.getTimezone());
         RateCard rateCard = rateCardResolver.resolve(request.lotId(), request.vehicleType(), requestedAt);
+        DemandPricingService.DemandAdjustment demand = demandPricingService.resolve(
+                request.lotId(), request.vehicleType(), request.plannedStart(), request.plannedEnd(), reservation.getId(), rateCard);
         BillingBreakdown breakdown = billingCalculator.calculate(
-                request.plannedStart(), request.plannedEnd(), lotTimezone, rateCard);
+                request.plannedStart(), request.plannedEnd(), lotTimezone, demand.rateCard(), demand.metric());
+        PricingPromotion promotion = promotionService.findHeld(reservation.getId());
+        breakdown = billingCalculator.applyPromotion(breakdown, promotion);
 
         ParkingInvoice invoice = ParkingInvoice.builder()
                 .reservation(reservation)
@@ -165,7 +180,13 @@ public class BillingReservationService {
 
     public ReservationResponse checkInPaid(UUID reservationId) {
         requirePaidInvoice(reservationId);
-        return reservationService.checkIn(reservationId);
+        ReservationResponse response = reservationService.checkIn(reservationId);
+        if (response.status() == Reservation.Status.NO_SHOW) {
+            promotionService.release(reservationId);
+        } else {
+            promotionService.consume(reservationId);
+        }
+        return response;
     }
 
     public ReservationResponse checkOutIdempotent(UUID reservationId) {

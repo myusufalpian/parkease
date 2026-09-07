@@ -12,7 +12,12 @@ public record ReservationRequest(
         @NotBlank @Size(max = 50) String vehicleType,
         @NotBlank @Size(max = 20) String plate,
         @NotNull OffsetDateTime plannedStart,
-        @NotNull OffsetDateTime plannedEnd) {
+        @NotNull OffsetDateTime plannedEnd,
+        @Size(max = 50) String promoCode) {
+
+    public ReservationRequest(UUID lotId, String vehicleType, String plate, OffsetDateTime plannedStart, OffsetDateTime plannedEnd) {
+        this(lotId, vehicleType, plate, plannedStart, plannedEnd, null);
+    }
 
     @AssertTrue(message = "planned end must be after planned start")
     public boolean isPlannedWindowValid() {

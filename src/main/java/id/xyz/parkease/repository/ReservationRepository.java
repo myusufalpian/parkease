@@ -28,6 +28,9 @@ public interface ReservationRepository extends JpaRepository<Reservation, UUID> 
             @Param("to") OffsetDateTime to,
             @Param("status") Status status);
 
+    @Query("SELECT r FROM Reservation r WHERE r.plannedStart < :end AND r.plannedEnd > :start AND r.status IN :statuses")
+    List<Reservation> findOverlapping(@Param("start") OffsetDateTime start, @Param("end") OffsetDateTime end, @Param("statuses") List<Status> statuses);
+
     @Query("SELECT r FROM Reservation r WHERE r.status = :status AND r.actualEnd IS NOT NULL ORDER BY r.actualEnd DESC")
     List<Reservation> findCompletedRecent(@Param("status") Status status, Pageable pageable);
 }

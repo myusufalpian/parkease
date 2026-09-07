@@ -8,6 +8,7 @@ import java.util.Optional;
 import java.util.UUID;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
 
@@ -18,8 +19,9 @@ public interface PricingPromotionRepository extends JpaRepository<PricingPromoti
 
     List<PricingPromotion> findAllByStatus(PromoStatus status);
 
-    @Query("SELECT p FROM PricingPromotion p WHERE p.effectiveFrom <= :now AND p.effectiveTo >= :now AND p.status = :status AND (p.lot.id IS NULL OR p.lot.id = :lotId) AND (p.vehicleType IS NULL OR p.vehicleType = :vehicleType) AND (p.customerType IS NULL OR p.customerType = :customerType)")
-    Optional<PricingPromotion> findActiveByScope(
+    @Query("SELECT p FROM PricingPromotion p WHERE p.code = :code AND p.effectiveFrom <= :now AND p.effectiveTo > :now AND p.status = :status AND (p.lot.id IS NULL OR p.lot.id = :lotId) AND (p.vehicleType IS NULL OR p.vehicleType = :vehicleType) AND (p.customerType IS NULL OR p.customerType = :customerType)")
+    Optional<PricingPromotion> findEligible(
+            @Param("code") String code,
             @Param("now") OffsetDateTime now,
             @Param("status") PromoStatus status,
             @Param("lotId") UUID lotId,
@@ -28,4 +30,12 @@ public interface PricingPromotionRepository extends JpaRepository<PricingPromoti
 
     @Query("SELECT p FROM PricingPromotion p WHERE p.usageCount < p.usageLimit AND p.usageLimit IS NOT NULL")
     List<PricingPromotion> findWithRemainingUsage();
+
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query("UPDATE PricingPromotion p SET p.usageCount = p.usageCount + 1, p.updatedAt = :now WHERE p.code = :code AND p.status = :status AND (p.usageLimit IS NULL OR p.usageCount < p.usageLimit)")
+    int claim(@Param("code") String code, @Param("status") PromoStatus status, @Param("now") OffsetDateTime now);
+
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query("UPDATE PricingPromotion p SET p.usageCount = p.usageCount - 1, p.updatedAt = :now WHERE p.code = :code AND p.usageCount > 0")
+    int release(@Param("code") String code, @Param("now") OffsetDateTime now);
 }

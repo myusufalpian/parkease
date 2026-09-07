@@ -29,6 +29,7 @@ public class CustomerAccount {
     private static final int PASSWORD_HASH_MAX = 255;
     private static final int STATUS_MAX = 20;
     private static final int ROLE_MAX = 20;
+    private static final int CUSTOMER_TYPE_MAX = 50;
 
     @Id
     @Column(name = "id", nullable = false, updatable = false)
@@ -50,6 +51,11 @@ public class CustomerAccount {
     @Builder.Default
     private Role role = Role.CUSTOMER;
 
+    @Size(max = CUSTOMER_TYPE_MAX, message = "Customer type exceeds maximum length")
+    @Column(name = "customer_type", nullable = false, length = CUSTOMER_TYPE_MAX)
+    @Builder.Default
+    private String customerType = "GENERAL";
+
     @Enumerated(EnumType.STRING)
     @Column(name = "status", nullable = false, length = STATUS_MAX)
     @Builder.Default
@@ -62,6 +68,11 @@ public class CustomerAccount {
     @Column(name = "updated_at", nullable = false)
     @Builder.Default
     private OffsetDateTime updatedAt = OffsetDateTime.now();
+
+    public CustomerAccount(UUID id, String username, String passwordHash, Role role,
+                           AccountStatus status, OffsetDateTime createdAt, OffsetDateTime updatedAt) {
+        this(id, username, passwordHash, role, "GENERAL", status, createdAt, updatedAt);
+    }
 
     public enum Role {
         CUSTOMER,

@@ -43,6 +43,8 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
         ReservationMapper.class,
         InvoiceMapper.class,
         PricingSnapshotMapper.class,
+        PromotionService.class,
+        DemandPricingService.class,
         BillingReservationServiceExtensionGateTest.TestBeans.class})
 class BillingReservationServiceExtensionGateTest {
 

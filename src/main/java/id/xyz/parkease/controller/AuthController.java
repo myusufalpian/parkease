@@ -6,6 +6,7 @@ import id.xyz.parkease.dto.LogoutRequest;
 import id.xyz.parkease.dto.RefreshRequest;
 import id.xyz.parkease.dto.RegisterRequest;
 import id.xyz.parkease.service.AuthService;
+import id.xyz.parkease.security.AuthRateLimiter;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
@@ -22,19 +23,23 @@ public class AuthController {
     private static final int USER_AGENT_MAX = 500;
 
     private final AuthService authService;
+    private final AuthRateLimiter authRateLimiter;
 
-    public AuthController(AuthService authService) {
+    public AuthController(AuthService authService, AuthRateLimiter authRateLimiter) {
         this.authService = authService;
+        this.authRateLimiter = authRateLimiter;
     }
 
     @PostMapping("/register")
     public ResponseEntity<AuthResponse> register(@Valid @RequestBody RegisterRequest request, HttpServletRequest servletRequest) {
+        authRateLimiter.check("register", clientIp(servletRequest));
         AuthResponse response = authService.register(request, userAgent(servletRequest), clientIp(servletRequest));
         return ResponseEntity.status(HttpStatus.CREATED).body(response);
     }
 
     @PostMapping("/login")
     public AuthResponse login(@Valid @RequestBody LoginRequest request, HttpServletRequest servletRequest) {
+        authRateLimiter.check("login", clientIp(servletRequest));
         return authService.login(request, userAgent(servletRequest), clientIp(servletRequest));
     }
 

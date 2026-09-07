@@ -45,6 +45,7 @@ public class BillingCancellationService {
     private final ReservationMapper reservationMapper;
     private final PaymentReferenceSnapshotMapper paymentReferenceSnapshotMapper;
     private final AuditService auditService;
+    private final PromotionService promotionService;
     private final Clock clock;
 
     public BillingCancellationService(
@@ -58,6 +59,7 @@ public class BillingCancellationService {
             ReservationMapper reservationMapper,
             PaymentReferenceSnapshotMapper paymentReferenceSnapshotMapper,
             AuditService auditService,
+            PromotionService promotionService,
             Clock clock) {
         this.reservationService = Objects.requireNonNull(reservationService);
         this.reservationRepository = Objects.requireNonNull(reservationRepository);
@@ -69,6 +71,7 @@ public class BillingCancellationService {
         this.reservationMapper = Objects.requireNonNull(reservationMapper);
         this.paymentReferenceSnapshotMapper = Objects.requireNonNull(paymentReferenceSnapshotMapper);
         this.auditService = Objects.requireNonNull(auditService);
+        this.promotionService = Objects.requireNonNull(promotionService);
         this.clock = Objects.requireNonNull(clock);
     }
 
@@ -99,6 +102,7 @@ public class BillingCancellationService {
         ReservationResponse reservationResponse = reservationService.cancel(reservationId, reason, requestedAt);
         Reservation reservation = reservationRepository.findById(reservationId)
                 .orElseThrow(() -> new ResourceNotFoundException("reservation was not found"));
+        promotionService.release(reservationId);
         boolean transitionedToCancelled = wasCancellable && reservation.getStatus() == Status.CANCELLED;
 
         ParkingInvoice invoice = parkingInvoiceRepository.findByReservation_Id(reservationId).orElse(null);

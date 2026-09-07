@@ -4,6 +4,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import id.xyz.parkease.exception.ErrorResponse;
 import id.xyz.parkease.exception.UnauthorizedException;
+import id.xyz.parkease.domain.CustomerAccount;
+import id.xyz.parkease.repository.CustomerAccountRepository;
 import id.xyz.parkease.security.JwtTokenService.AccessTokenClaims;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
@@ -33,10 +35,12 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
             Pattern.compile("^/api/v1/lots/[^/]+/availability$");
 
     private final JwtTokenService jwtTokenService;
+    private final CustomerAccountRepository customerAccountRepository;
     private final ObjectMapper objectMapper = new ObjectMapper().registerModule(new JavaTimeModule());
 
-    public JwtAuthenticationFilter(JwtTokenService jwtTokenService) {
+    public JwtAuthenticationFilter(JwtTokenService jwtTokenService, CustomerAccountRepository customerAccountRepository) {
         this.jwtTokenService = Objects.requireNonNull(jwtTokenService);
+        this.customerAccountRepository = Objects.requireNonNull(customerAccountRepository);
     }
 
     @Override
@@ -88,7 +92,12 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
         }
         String token = header.substring(BEARER_PREFIX.length());
         AccessTokenClaims claims = jwtTokenService.parseAccessToken(token);
-        return new AuthenticatedPrincipal(claims.customerAccountId(), claims.role());
+        CustomerAccount account = customerAccountRepository.findById(claims.customerAccountId())
+                .orElseThrow(() -> new UnauthorizedException("account is not available"));
+        if (account.getStatus() != CustomerAccount.AccountStatus.ACTIVE) {
+            throw new UnauthorizedException("account is disabled");
+        }
+        return new AuthenticatedPrincipal(account.getId(), account.getRole());
     }
 
     private void writeUnauthorized(HttpServletResponse response, String message) throws IOException {
