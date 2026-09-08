@@ -5,21 +5,22 @@ import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.Map;
 import java.util.Objects;
 import org.springframework.stereotype.Component;
 
 @Component
-public class AuthRateLimiter {
+public class PublicApiRateLimiter {
 
-    private static final int MAX_ATTEMPTS = 10;
+    private static final int MAX_ATTEMPTS = 60;
     private static final int MAX_KEYS = 10_000;
     private static final Duration WINDOW = Duration.ofMinutes(1);
 
     private final Clock clock;
     private final Map<String, Window> windows = new HashMap<>();
 
-    public AuthRateLimiter(Clock clock) {
+    public PublicApiRateLimiter(Clock clock) {
         this.clock = Objects.requireNonNull(clock);
     }
 
@@ -33,7 +34,7 @@ public class AuthRateLimiter {
             windows.put(key, window);
         }
         if (window.attempts >= MAX_ATTEMPTS) {
-            throw new TooManyRequestsException("too many authentication requests");
+            throw new TooManyRequestsException("too many requests");
         }
         window.attempts++;
     }

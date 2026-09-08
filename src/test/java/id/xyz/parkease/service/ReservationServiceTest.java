@@ -11,6 +11,8 @@ import id.xyz.parkease.dto.AvailabilityResponse;
 import id.xyz.parkease.event.ReservationCheckedOutEvent;
 import id.xyz.parkease.exception.ConflictException;
 import id.xyz.parkease.exception.BusinessValidationException;
+import id.xyz.parkease.config.BookingProperties;
+import id.xyz.parkease.mapper.BlockMapper;
 import id.xyz.parkease.mapper.ReservationMapper;
 import id.xyz.parkease.repository.ParkingLotRepository;
 import id.xyz.parkease.repository.ParkingSlotRepository;
@@ -39,14 +41,14 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @DataJpaTest
 @AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE)
-@Import({ReservationService.class, ReservationMapper.class, ReservationServiceTest.TestBeans.class})
+@Import({ReservationService.class, ReservationMapper.class, BookingWindowValidator.class, InventoryConflictService.class, BlockMapper.class, ReservationServiceTest.TestBeans.class})
 class ReservationServiceTest {
 
     private static final OffsetDateTime PLANNED_START = OffsetDateTime.parse("2024-01-15T09:00:00+07:00");
     private static final OffsetDateTime PLANNED_END = OffsetDateTime.parse("2024-01-15T11:00:00+07:00");
     private static final OffsetDateTime CHECK_IN = OffsetDateTime.parse("2024-01-15T09:15:00+07:00");
     private static final OffsetDateTime CHECK_OUT = OffsetDateTime.parse("2024-01-15T10:30:00+07:00");
-    private static final OffsetDateTime FIXED_NOW = OffsetDateTime.parse("2024-01-15T08:00:00Z");
+    private static final OffsetDateTime FIXED_NOW = OffsetDateTime.parse("2024-01-15T01:00:00Z");
     private static final String VEHICLE_TYPE = "CAR";
     private static final String LOT_TIMEZONE = "Asia/Jakarta";
 
@@ -327,9 +329,14 @@ class ReservationServiceTest {
     static class TestBeans {
 
         @Bean
+        BookingProperties bookingProperties() {
+            return new BookingProperties(30, 90);
+        }
+
+        @Bean
         @Primary
         Clock fixedClock() {
-            return Clock.fixed(Instant.parse("2024-01-15T08:00:00Z"), ZoneOffset.UTC);
+            return Clock.fixed(Instant.parse("2024-01-15T01:00:00Z"), ZoneOffset.UTC);
         }
 
         @Bean
