@@ -29,10 +29,16 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
 
     private static final String BEARER_PREFIX = "Bearer ";
     private static final String AUTH_PATH_PREFIX = "/api/v1/auth/";
-    private static final Set<String> PUBLIC_ACTUATOR_PATHS = Set.of("/actuator/health", "/actuator/info");
-    // Public availability endpoint: GET /api/v1/lots/{lotId}/availability
+    private static final Set<String> PUBLIC_ACTUATOR_PATHS = Set.of(
+            "/actuator/health",
+            "/actuator/health/readiness",
+            "/actuator/health/liveness",
+            "/actuator/info");
     private static final Pattern AVAILABILITY_PATTERN =
             Pattern.compile("^/api/v1/lots/[^/]+/availability$");
+    private static final Pattern LOTS_PATTERN = Pattern.compile("^/api/v1/lots$");
+    private static final Pattern LOT_DETAIL_PATTERN = Pattern.compile("^/api/v1/lots/[^/]+$");
+    private static final Pattern LOT_SLOTS_PATTERN = Pattern.compile("^/api/v1/lots/[^/]+/slots$");
 
     private final JwtTokenService jwtTokenService;
     private final CustomerAccountRepository customerAccountRepository;
@@ -53,7 +59,14 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
         if (PUBLIC_ACTUATOR_PATHS.contains(uri) && "GET".equalsIgnoreCase(method)) {
             return true;
         }
-        return "GET".equalsIgnoreCase(method) && AVAILABILITY_PATTERN.matcher(uri).matches();
+        if (("GET".equalsIgnoreCase(method) || "HEAD".equalsIgnoreCase(method))
+                && (AVAILABILITY_PATTERN.matcher(uri).matches()
+                        || LOTS_PATTERN.matcher(uri).matches()
+                        || LOT_DETAIL_PATTERN.matcher(uri).matches()
+                        || LOT_SLOTS_PATTERN.matcher(uri).matches())) {
+            return true;
+        }
+        return false;
     }
 
     // Defense-in-depth against trailing-slash/matrix/duplicate-slash variants so

@@ -11,11 +11,11 @@ import id.xyz.parkease.event.ReservationCheckedOutEvent;
 import id.xyz.parkease.exception.BusinessValidationException;
 import id.xyz.parkease.exception.ConflictException;
 import id.xyz.parkease.exception.ResourceNotFoundException;
+import id.xyz.parkease.exception.SqlState;
 import id.xyz.parkease.mapper.ReservationMapper;
 import id.xyz.parkease.repository.ParkingLotRepository;
 import id.xyz.parkease.repository.ParkingSlotRepository;
 import id.xyz.parkease.repository.ReservationRepository;
-import java.sql.SQLException;
 import java.time.Clock;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
@@ -34,13 +34,14 @@ public class ReservationService {
     public static final long CHECK_IN_GRACE_MINUTES = 30L;
     private static final int CANCELLATION_REASON_MAX_LENGTH = 100;
     private static final long MAX_RESERVATION_DAYS = 31L;
-    private static final String OVERLAP_SQL_STATE = "23P01";
 
     private final ParkingLotRepository parkingLotRepository;
     private final ParkingSlotRepository parkingSlotRepository;
     private final ReservationRepository reservationRepository;
     private final ReservationMapper reservationMapper;
     private final ApplicationEventPublisher eventPublisher;
+    private final BookingWindowValidator bookingWindowValidator;
+    private final InventoryConflictService inventoryConflictService;
     private final Clock clock;
 
     public ReservationService(
@@ -49,12 +50,16 @@ public class ReservationService {
             ReservationRepository reservationRepository,
             ReservationMapper reservationMapper,
             ApplicationEventPublisher eventPublisher,
+            BookingWindowValidator bookingWindowValidator,
+            InventoryConflictService inventoryConflictService,
             Clock clock) {
         this.parkingLotRepository = Objects.requireNonNull(parkingLotRepository);
         this.parkingSlotRepository = Objects.requireNonNull(parkingSlotRepository);
         this.reservationRepository = Objects.requireNonNull(reservationRepository);
         this.reservationMapper = Objects.requireNonNull(reservationMapper);
         this.eventPublisher = Objects.requireNonNull(eventPublisher);
+        this.bookingWindowValidator = Objects.requireNonNull(bookingWindowValidator);
+        this.inventoryConflictService = Objects.requireNonNull(inventoryConflictService);
         this.clock = Objects.requireNonNull(clock);
     }
 
@@ -64,19 +69,20 @@ public class ReservationService {
 
     public ReservationResponse createReservation(ReservationRequest request, OffsetDateTime requestedAt) {
         validateRequest(request);
-        validateWindow(request.plannedStart(), request.plannedEnd());
         Objects.requireNonNull(requestedAt, "requestedAt must not be null");
+        bookingWindowValidator.validate(request.plannedStart(), request.plannedEnd(), requestedAt);
         parkingLotRepository.findById(request.lotId())
                 .orElseThrow(() -> new ResourceNotFoundException("parking lot was not found"));
 
-        ParkingSlot slot = findDeterministicAvailableSlot(request.lotId(), request.vehicleType());
-        ParkingSlot reservedSlot = parkingSlotRepository.save(slot.markReserved());
+        ParkingSlot slot = findDeterministicAvailableSlot(request.lotId(), request.vehicleType(), request.plannedStart(), request.plannedEnd());
+        ParkingSlot locked = inventoryConflictService.requireNoConflictForReservation(slot.getId(), request.plannedStart(), request.plannedEnd(), null);
+        ParkingSlot reservedSlot = parkingSlotRepository.save(locked.markReserved());
         Reservation reservation = reservationMapper.toReservation(request, reservedSlot);
         try {
             Reservation savedReservation = reservationRepository.saveAndFlush(reservation);
             return reservationMapper.toResponse(savedReservation);
         } catch (DataIntegrityViolationException exception) {
-            if (isOverlapViolation(exception)) {
+            if (SqlState.isOverlapOrDeadlock(exception)) {
                 throw new ConflictException("the requested parking window is no longer available");
             }
             throw exception;
@@ -96,9 +102,9 @@ public class ReservationService {
 
         OffsetDateTime latestCheckIn = reservation.getPlannedStart().plusMinutes(CHECK_IN_GRACE_MINUTES);
         OffsetDateTime actualStart = requestedAt.isAfter(latestCheckIn) ? latestCheckIn : requestedAt;
-        ParkingSlot slot = reservation.getSlot();
+        ParkingSlot slot = inventoryConflictService.lockSlot(reservation.getSlot().getId());
         if (requestedAt.isAfter(latestCheckIn)) {
-            Reservation noShow = reservationRepository.save(reservation.markNoShow(actualStart));
+            Reservation noShow = reservationRepository.save(reservation.toBuilder().slot(slot).build().markNoShow(actualStart));
             parkingSlotRepository.save(slot.markAvailable());
             return reservationMapper.toResponse(noShow);
         }
@@ -126,7 +132,8 @@ public class ReservationService {
             throw new BusinessValidationException("checkout time must not be before check-in time");
         }
 
-        ParkingSlot availableSlot = parkingSlotRepository.save(reservation.getSlot().markAvailable());
+        ParkingSlot lockedSlot = inventoryConflictService.lockSlot(reservation.getSlot().getId());
+        ParkingSlot availableSlot = parkingSlotRepository.save(lockedSlot.markAvailable());
         Reservation completedReservation = reservation.toBuilder().slot(availableSlot).build().complete(requestedAt);
         Reservation savedReservation = reservationRepository.save(completedReservation);
         eventPublisher.publishEvent(new ReservationCheckedOutEvent(savedReservation.getId(), requestedAt));
@@ -156,7 +163,8 @@ public class ReservationService {
             throw new ConflictException("reservation cannot be cancelled");
         }
 
-        ParkingSlot availableSlot = parkingSlotRepository.save(reservation.getSlot().markAvailable());
+        ParkingSlot lockedSlot = inventoryConflictService.lockSlot(reservation.getSlot().getId());
+        ParkingSlot availableSlot = parkingSlotRepository.save(lockedSlot.markAvailable());
         Reservation cancelled = reservation.toBuilder().slot(availableSlot).build().cancel(reason, lateCancellation);
         Reservation savedReservation = reservationRepository.save(cancelled);
         return reservationMapper.toResponse(savedReservation);
@@ -169,15 +177,19 @@ public class ReservationService {
     public ReservationResponse extend(UUID reservationId, OffsetDateTime plannedEnd, OffsetDateTime requestedAt) {
         Reservation reservation = getReservation(reservationId);
         requireTime(requestedAt);
-        validateWindow(reservation.getPlannedStart(), plannedEnd);
+        bookingWindowValidator.validate(reservation.getPlannedStart(), plannedEnd, requestedAt);
         if (reservation.getStatus() != Status.PENDING && reservation.getStatus() != Status.ACTIVE) {
             throw new ConflictException("terminal reservation cannot be extended");
         }
         if (!plannedEnd.isAfter(reservation.getPlannedEnd())) {
             throw new BusinessValidationException("extension must be later than the current planned end");
         }
-        if (hasOverlappingReservation(reservation, plannedEnd)) {
+        inventoryConflictService.lockSlot(reservation.getSlot().getId());
+        if (inventoryConflictService.hasOverlappingReservation(reservation.getSlot().getId(), reservation.getPlannedStart(), plannedEnd, reservation.getId())) {
             throw new ConflictException("the requested extension conflicts with another reservation");
+        }
+        if (inventoryConflictService.hasActiveBlockOverlap(reservation.getSlot().getId(), reservation.getPlannedStart(), plannedEnd)) {
+            throw new ConflictException("the requested extension conflicts with a slot block");
         }
 
         Reservation extended = reservation.extendTo(plannedEnd);
@@ -185,12 +197,17 @@ public class ReservationService {
             Reservation savedReservation = reservationRepository.saveAndFlush(extended);
             return reservationMapper.toResponse(savedReservation);
         } catch (DataIntegrityViolationException exception) {
-            if (isOverlapViolation(exception)) {
+            if (SqlState.isOverlapOrDeadlock(exception)) {
                 throw new ConflictException("the requested extension conflicts with another reservation");
             }
             throw exception;
         }
     }
+
+    private static final List<Status> ACTIVE_STATUSES = List.of(Status.PENDING, Status.ACTIVE);
+    private static final SlotStatus MAINTENANCE_STATUS = SlotStatus.MAINTENANCE;
+    private static final id.xyz.parkease.domain.ParkingSlotBlock.BlockStatus ACTIVE_BLOCK_STATUS =
+            id.xyz.parkease.domain.ParkingSlotBlock.BlockStatus.ACTIVE;
 
     @Transactional(readOnly = true)
     public AvailabilityResponse getAvailability(
@@ -198,21 +215,18 @@ public class ReservationService {
             OffsetDateTime plannedStart,
             OffsetDateTime plannedEnd,
             String vehicleType) {
-        validateWindow(plannedStart, plannedEnd);
+        validateAvailabilityWindow(plannedStart, plannedEnd);
         parkingLotRepository.findById(lotId)
                 .orElseThrow(() -> new ResourceNotFoundException("parking lot was not found"));
-        List<ParkingSlot> availableSlots = parkingSlotRepository.findByLot_IdOrderByFloorAscSlotIdAsc(lotId).stream()
-                .filter(slot -> slot.getStatus() == SlotStatus.AVAILABLE)
-                .filter(slot -> vehicleType == null || vehicleType.equals(slot.getVehicleType()))
-                .filter(slot -> !hasOverlappingReservation(slot, plannedStart, plannedEnd))
-                .toList();
+        List<ParkingSlot> availableSlots = parkingSlotRepository.findAvailableSlots(
+                lotId, vehicleType, plannedStart, plannedEnd, ACTIVE_STATUSES, MAINTENANCE_STATUS, ACTIVE_BLOCK_STATUS);
         return reservationMapper.toAvailability(lotId, plannedStart, plannedEnd, availableSlots);
     }
 
-    private ParkingSlot findDeterministicAvailableSlot(UUID lotId, String vehicleType) {
-        return parkingSlotRepository.findByLot_IdOrderByFloorAscSlotIdAsc(lotId).stream()
-                .filter(slot -> slot.getStatus() == SlotStatus.AVAILABLE)
-                .filter(slot -> vehicleType.equals(slot.getVehicleType()))
+    private ParkingSlot findDeterministicAvailableSlot(UUID lotId, String vehicleType, OffsetDateTime plannedStart, OffsetDateTime plannedEnd) {
+        return parkingSlotRepository.findAvailableSlots(
+                        lotId, vehicleType, plannedStart, plannedEnd, ACTIVE_STATUSES, MAINTENANCE_STATUS, ACTIVE_BLOCK_STATUS)
+                .stream()
                 .findFirst()
                 .orElseThrow(() -> new ConflictException("no parking slot is available for the requested vehicle type"));
     }
@@ -221,34 +235,6 @@ public class ReservationService {
         Objects.requireNonNull(reservationId, "reservationId must not be null");
         return reservationRepository.findById(reservationId)
                 .orElseThrow(() -> new ResourceNotFoundException("reservation was not found"));
-    }
-
-    private boolean hasOverlappingReservation(Reservation reservation, OffsetDateTime plannedEnd) {
-        return hasOverlappingReservation(reservation.getSlot(), reservation.getPlannedStart(), plannedEnd, reservation.getId());
-    }
-
-    private boolean hasOverlappingReservation(ParkingSlot slot, OffsetDateTime plannedStart, OffsetDateTime plannedEnd) {
-        return hasOverlappingReservation(slot, plannedStart, plannedEnd, null);
-    }
-
-    private boolean hasOverlappingReservation(
-            ParkingSlot slot,
-            OffsetDateTime plannedStart,
-            OffsetDateTime plannedEnd,
-            UUID excludedReservationId) {
-        return activeReservations(slot).stream()
-                .filter(candidate -> !candidate.getId().equals(excludedReservationId))
-                .anyMatch(candidate -> plannedStart.isBefore(candidate.getPlannedEnd())
-                        && candidate.getPlannedStart().isBefore(plannedEnd));
-    }
-
-    private List<Reservation> activeReservations(ParkingSlot slot) {
-        return List.of(
-                        reservationRepository.findBySlot_IdAndStatus(slot.getId(), Status.PENDING),
-                        reservationRepository.findBySlot_IdAndStatus(slot.getId(), Status.ACTIVE))
-                .stream()
-                .flatMap(List::stream)
-                .toList();
     }
 
     private boolean isTerminal(Status status) {
@@ -261,7 +247,7 @@ public class ReservationService {
         }
     }
 
-    private void validateWindow(OffsetDateTime plannedStart, OffsetDateTime plannedEnd) {
+    private void validateAvailabilityWindow(OffsetDateTime plannedStart, OffsetDateTime plannedEnd) {
         if (plannedStart == null || plannedEnd == null || !plannedStart.isBefore(plannedEnd)) {
             throw new BusinessValidationException("planned end must be after planned start");
         }
@@ -282,16 +268,5 @@ public class ReservationService {
 
     private OffsetDateTime currentTime() {
         return OffsetDateTime.ofInstant(clock.instant(), ZoneOffset.UTC);
-    }
-
-    private boolean isOverlapViolation(Throwable exception) {
-        Throwable current = exception;
-        while (current != null) {
-            if (current instanceof SQLException sqlException && OVERLAP_SQL_STATE.equals(sqlException.getSQLState())) {
-                return true;
-            }
-            current = current.getCause();
-        }
-        return false;
     }
 }

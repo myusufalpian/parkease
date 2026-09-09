@@ -22,3 +22,6 @@ parkease:
   billing:
     payment-timeout-minutes: 10
     cancellation-fee-rate: 0.10
+  booking:
+    minimum-duration-minutes: 30
+    future-horizon-days: 90

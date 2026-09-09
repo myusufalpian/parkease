@@ -2,9 +2,9 @@
 
 ## Current State
 
-The reservation lifecycle/API, planned-time prepayment billing, payment/refund workflow via an outbox, custom JWT authentication, per-object authorization, rate-card and invoice persistence, promotion holds, demand pricing, rate limiting, and an append-only audit trail are implemented. Flyway migrations `V1`–`V16` back these on PostgreSQL.
+The reservation lifecycle/API, planned-time prepayment billing, payment/refund workflow via an outbox, custom JWT authentication, per-object authorization, rate-card and invoice persistence, promotion holds, demand pricing, lot/slot discovery, time-bounded slot blocks, configurable booking windows, rate limiting, and an append-only audit trail are implemented. Flyway migrations `V1`–`V18` back these on PostgreSQL.
 
-Local test evidence: the unit tier (H2) passes 163 tests; the PostgreSQL/Testcontainers tier passes 10 tests, including the exclusion-constraint and multi-instance concurrency cases. Under 20-way concurrent overlapping inserts the exclusion guard surfaces as either an exclusion violation (`23P01`) or a deadlock (`40P01`); both prove exactly one winner. This is engine-level evidence, not production load proof (see Gate conditions).
+Local test evidence: `./gradlew test --no-daemon --console=plain` passes in the current workspace. The test suite covers booking-window validation, Flyway V17/V18 contracts, lot discovery, slot-block lifecycle/security, reservation-block integration, PostgreSQL exclusion behavior, and existing billing/auth flows. This is test-suite evidence, not production load proof (see Gate conditions).
 
 Deferred: Redis advisory caching, distributed rate limiting, and a production payment provider. The bundled `PaymentAdapter` is an in-process implementation excluded from the `prod` profile; production must wire a real adapter or startup fails closed. The supported Docker deployment target is one application instance.
 
@@ -85,7 +85,7 @@ Access tokens are checked against the current account status on every protected 
 
 ## Data Components
 
-Tables (Flyway `V1`–`V16`):
+Tables (Flyway `V1`–`V18`):
 
 ```text
 parking_lot, parking_slot, reservation, pricing_promotion, demand_pricing_rule (V1)
@@ -99,6 +99,8 @@ outbox_event                                                 (V10)
 extension_charge                                             (V11, payment status V14)
 audit_record                                                 (V13)
 promotion_hold                                               (V16)
+parking_slot_block                                           (V17)
+canonical lot/slot/rate-card seed                            (V18)
 ```
 
 Important constraints (present in the migrations):
@@ -114,9 +116,31 @@ UNIQUE customer_account(username)                          (V4)
 UNIQUE session(refresh_token_hash)                         (V5)
 CHECK  non-negative money on rate_card / parking_invoice   (V12)
 TRIGGER published rate_card is immutable                   (V12, extended V15)
+EXCLUDE GIST parking_slot_block(slot_id, tstzrange(blocked_start, blocked_end)) WHERE status = 'ACTIVE' (V17)
+CHECK blocked_start < blocked_end                            (V17)
 ```
 
 `billing_operation` records durable operation state; it is not a generic lock table. Reservation `owner_id` binding lives in the separate `reservation_owner` join table.
+
+### Inventory and booking windows
+
+Flyway `V18` seeds two canonical lots with deterministic UUIDs, eight parking slots, and active CAR/MOTORCYCLE rate cards. The seed is idempotent by UUID and supplies the baseline inventory used by local and integration environments.
+
+`ParkingSlotBlock` stores an operational block for one slot using a half-open interval `[blocked_start, blocked_end)`. Its states are `ACTIVE`, `CANCELLED`, and `EXPIRED`. Only active blocks participate in conflict checks. Expiration is evaluated at read/write time; correctness does not depend on a scheduler.
+
+Booking windows are validated by `BookingWindowValidator` using the application clock:
+
+```text
+plannedStart < plannedEnd
+duration >= parkease.booking.minimum-duration-minutes (default 30)
+plannedStart >= now
+plannedStart <= now + parkease.booking.future-horizon-days (default 90)
+duration <= 31 days
+```
+
+Availability excludes slots in `MAINTENANCE`, PENDING/ACTIVE reservations overlapping the requested interval, and ACTIVE slot blocks overlapping the requested interval. `RESERVED` and `OCCUPIED` are lifecycle states and are not global time-window filters.
+
+`InventoryConflictService` locks a slot with PostgreSQL `PESSIMISTIC_WRITE` before reservation or block conflict checks. Reservation and block writes then check both conflict sources in the same transaction; the database exclusion constraints remain the final same-table guard.
 
 ## Request Flows
 
@@ -124,13 +148,21 @@ TRIGGER published rate_card is immutable                   (V12, extended V15)
 
 1. Authorize customer and validate request.
 2. Begin PostgreSQL transaction.
-3. Select an available slot and resolve the immutable rate card.
+3. Validate the booking window and select a deterministic slot after locking/checking reservation and block conflicts.
 4. Resolve demand pricing, apply an eligible promotion hold, and calculate the planned-time invoice using continuous blocks.
 5. Persist reservation, pricing snapshot, invoice `PAYMENT_PENDING`, and payment/outbox operation.
 6. Commit the slot hold.
 7. Payment adapter captures payment idempotently.
 8. On success, mark invoice `PAID`; reservation can check in.
 9. On failure or 10-minute timeout, cancel the unpaid hold and release the slot.
+
+### Inventory discovery and slot blocking
+
+- Public lot reads expose `GET /api/v1/lots`, `GET /api/v1/lots/{lotId}`, and `GET /api/v1/lots/{lotId}/slots`; responses are deterministically ordered and unknown lots return `404`.
+- Public availability is exposed by `GET /api/v1/lots/{lotId}/availability` and is protected by a per-IP public API rate limiter.
+- `OPERATOR` and `ADMIN` users can create, list, and cancel blocks through `/api/v1/admin/**`.
+- Block creation locks the slot, rejects reservation/block overlap, persists an ACTIVE block, and records an audit event.
+- Block cancellation is idempotent for already terminal blocks; expired ACTIVE blocks become EXPIRED when read or changed.
 
 ### Check-in and checkout
 
@@ -150,19 +182,26 @@ TRIGGER published rate_card is immutable                   (V12, extended V15)
 ## Consistency and Idempotency
 
 - PostgreSQL exclusion constraint remains the source of truth for overlapping reservation windows.
+- PostgreSQL exclusion constraint on `parking_slot_block` remains the source of truth for overlapping ACTIVE blocks.
+- Reservation/block cross-conflicts are checked while holding a pessimistic write lock on the slot row.
 - Invoice creation is protected by `UNIQUE(reservation_id)`.
 - State transitions use conditional updates or row locks and verify affected-row count.
+- Booking windows are validated against the injected application clock and configured duration/horizon limits.
 - Payment/refund/outbox operations use durable idempotency keys.
 - No generic application lock is required for multi-instance correctness.
 
 ## API Contracts
 
 - `POST /api/v1/auth/register`, `/login`, `/refresh`, and `/logout` implement account and session lifecycle; login/register are rate-limited for the single-instance target.
-- `GET /api/v1/lots/{lotId}/availability` is public and returns available slots for a requested time window.
+- `GET /api/v1/lots`, `GET /api/v1/lots/{lotId}`, and `GET /api/v1/lots/{lotId}/slots` are public inventory discovery endpoints with deterministic ordering.
+- `GET /api/v1/lots/{lotId}/availability` is public and returns available slots for a requested time window; public lot and availability reads use an in-process per-IP rate limiter.
+- `POST /api/v1/admin/slots/{slotId}/blocks`, `GET /api/v1/admin/slots/{slotId}/blocks`, and `DELETE /api/v1/admin/slot-blocks/{blockId}` require `OPERATOR` or `ADMIN` authentication.
 - `POST /api/v1/reservations` returns reservation, invoice, and payment status; eligible promotion and demand pricing decisions are included in the pricing snapshot.
 - `POST /api/v1/reservations/{id}/check-out` completes lifecycle only; invoice already exists.
 - `DELETE /api/v1/reservations/{id}` returns cancellation fee, refund amount, and refund status.
 - `GET /api/v1/invoices/{reservationId}` requires owner/operator authorization.
+
+Handled API errors use `{ timestamp, status, code, message }`. Validation errors use `INVALID_REQUEST` or `BUSINESS_VALIDATION_FAILED`; authentication/role failures use `UNAUTHORIZED`/`FORBIDDEN`; missing resources use `RESOURCE_NOT_FOUND`; inventory overlap and lifecycle conflicts use `CONFLICT`.
 
 ## Observability and SLO
 
@@ -200,7 +239,7 @@ Rejected as the primary concurrency mechanism. It introduces stale-lock cleanup 
 
 ## Deployment and Recovery
 
-Migrations are additive: customer account, rate card, invoice, payment/refund, operation, and outbox tables are introduced before application writes depend on them. Invoice and refund data are never destructively rolled back; recovery uses forward fixes, backup/restore, and reconciliation.
+Migrations are additive: customer account, rate card, invoice, payment/refund, operation, outbox, and slot-block tables are introduced before application writes depend on them. V18 supplies deterministic canonical inventory and baseline rate-card data. Invoice and refund data are never destructively rolled back; recovery uses forward fixes, backup/restore, and reconciliation.
 
 Before public exposure:
 

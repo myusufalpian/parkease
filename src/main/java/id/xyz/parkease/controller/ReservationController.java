@@ -13,6 +13,7 @@ import id.xyz.parkease.repository.ExtensionChargeRepository;
 import id.xyz.parkease.repository.ParkingInvoiceRepository;
 import id.xyz.parkease.security.AuthenticatedPrincipal;
 import id.xyz.parkease.security.JwtAuthenticationFilter;
+import id.xyz.parkease.security.PublicApiRateLimiter;
 import id.xyz.parkease.service.AuthorizationService;
 import id.xyz.parkease.service.BillingCancellationService;
 import id.xyz.parkease.service.BillingExtensionService;
@@ -51,6 +52,7 @@ public class ReservationController {
     private final OutboxDispatcher outboxDispatcher;
     private final ParkingInvoiceRepository parkingInvoiceRepository;
     private final ExtensionChargeRepository extensionChargeRepository;
+    private final PublicApiRateLimiter rateLimiter;
 
     public ReservationController(
             ReservationService reservationService,
@@ -60,7 +62,8 @@ public class ReservationController {
             AuthorizationService authorizationService,
             OutboxDispatcher outboxDispatcher,
             ParkingInvoiceRepository parkingInvoiceRepository,
-            ExtensionChargeRepository extensionChargeRepository) {
+            ExtensionChargeRepository extensionChargeRepository,
+            PublicApiRateLimiter rateLimiter) {
         this.reservationService = reservationService;
         this.billingReservationService = billingReservationService;
         this.billingCancellationService = billingCancellationService;
@@ -69,6 +72,7 @@ public class ReservationController {
         this.outboxDispatcher = outboxDispatcher;
         this.parkingInvoiceRepository = parkingInvoiceRepository;
         this.extensionChargeRepository = extensionChargeRepository;
+        this.rateLimiter = rateLimiter;
     }
 
     @PostMapping("/reservations")
@@ -125,7 +129,9 @@ public class ReservationController {
             @PathVariable UUID lotId,
             @RequestParam("start") @NotNull @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME) OffsetDateTime plannedStart,
             @RequestParam("end") @NotNull @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME) OffsetDateTime plannedEnd,
-            @RequestParam(value = "vehicleType", required = false) String vehicleType) {
+            @RequestParam(value = "vehicleType", required = false) String vehicleType,
+            HttpServletRequest request) {
+        rateLimiter.check("lots:availability", request.getRemoteAddr());
         return reservationService.getAvailability(lotId, plannedStart, plannedEnd, vehicleType);
     }
 

@@ -7,6 +7,8 @@ import id.xyz.parkease.domain.ParkingSlot;
 import id.xyz.parkease.domain.Reservation;
 import id.xyz.parkease.domain.Reservation.Status;
 import id.xyz.parkease.exception.ConflictException;
+import id.xyz.parkease.config.BookingProperties;
+import id.xyz.parkease.mapper.BlockMapper;
 import id.xyz.parkease.mapper.InvoiceMapper;
 import id.xyz.parkease.mapper.PricingSnapshotMapper;
 import id.xyz.parkease.mapper.ReservationMapper;
@@ -45,6 +47,9 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
         PricingSnapshotMapper.class,
         PromotionService.class,
         DemandPricingService.class,
+        BookingWindowValidator.class,
+        InventoryConflictService.class,
+        BlockMapper.class,
         BillingReservationServiceExtensionGateTest.TestBeans.class})
 class BillingReservationServiceExtensionGateTest {
 
@@ -102,6 +107,11 @@ class BillingReservationServiceExtensionGateTest {
 
     @TestConfiguration
     static class TestBeans {
+
+        @Bean
+        BookingProperties bookingProperties() {
+            return new BookingProperties(30, 90);
+        }
 
         @Bean
         @Primary
