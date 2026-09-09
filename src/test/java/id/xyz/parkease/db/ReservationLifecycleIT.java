@@ -35,7 +35,7 @@ class ReservationLifecycleIT {
     private static final OffsetDateTime PLANNED_END = OffsetDateTime.parse("2024-01-15T11:00:00+07:00");
     private static final OffsetDateTime CHECK_IN = OffsetDateTime.parse("2024-01-15T09:15:00+07:00");
     private static final OffsetDateTime CHECK_OUT = OffsetDateTime.parse("2024-01-15T10:30:00+07:00");
-    private static final OffsetDateTime REQUESTED_AT = OffsetDateTime.parse("2024-01-15T08:00:00Z");
+    private static final OffsetDateTime REQUESTED_AT = OffsetDateTime.parse("2024-01-15T01:00:00Z");
 
     private static final PostgreSQLContainer<?> POSTGRES = new PostgreSQLContainer<>(POSTGRES_IMAGE);
 
